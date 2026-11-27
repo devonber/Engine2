@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    name: Windows / ${{ matrix.preset }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [msvc-debug, msvc-release, clangcl-release]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DENGINE_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+  linux:
+    name: Linux / ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [linux-gcc-debug, linux-gcc-release, linux-clang-release, linux-gcc-asan]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DENGINE_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: clang-format
+        run: find engine apps tests bench -name '*.[ch]pp' | xargs clang-format --dry-run --Werror
