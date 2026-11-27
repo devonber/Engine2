@@ -25,6 +25,7 @@ layout(location = 2) flat out uint outLayer;
 layout(location = 3) flat out float outShade;
 
 // Per face (PosX, NegX, PosY, NegY, PosZ, NegZ): base corner, U axis, V axis.
+// Must match kFaceAxes in engine/voxel/Mesher.hpp (width runs along U, height along V).
 // U x V points out of the block, so corners (0,0) (1,0) (0,1) (1,1) wound
 // 0-1-2 / 2-1-3 are counter-clockwise seen from outside.
 const vec3 kBase[6] = vec3[6](vec3(1, 0, 0), vec3(0, 0, 0), vec3(0, 1, 0), vec3(0, 0, 0), vec3(0, 0, 1), vec3(0, 0, 0));
@@ -34,8 +35,9 @@ const vec3 kV[6]    = vec3[6](vec3(0, 0, 1), vec3(0, 1, 0), vec3(1, 0, 0), vec3(
 // Cheap directional lighting baked per face.
 const float kShade[6] = float[6](0.80, 0.80, 1.00, 0.50, 0.65, 0.65);
 
-// Texture coordinates from the corner's position inside the block (0..1 on
-// each axis). Side faces put the texture's top edge at the block's top and
+// Texture coordinates from the corner's position relative to the quad's first
+// block (0..width / 0..height). The sampler repeats, so a merged quad shows one
+// texture tile per block, exactly like separate faces. Side faces put the texture's top edge at the block's top and
 // read left-to-right when seen from outside; top/bottom faces map x/z.
 vec2 faceUV(uint face, vec3 o)
 {
@@ -58,10 +60,12 @@ void main()
     const uvec3 local = uvec3(q.x & 63u, (q.x >> 6) & 63u, (q.x >> 12) & 63u);
     const uint face = (q.x >> 18) & 7u;
     const uint block = q.y & 0xFFFFu;
+    // Greedy-merged quads cover width x height block faces.
+    const vec2 size = vec2(float(((q.x >> 21) & 31u) + 1u), float(((q.x >> 26) & 31u) + 1u));
 
     const ivec3 voxel = chunkOrigins[gl_InstanceIndex].xyz + ivec3(local);
     const vec2 corner2 = vec2(float(corner & 1u), float(corner >> 1));
-    const vec3 inBlock = kBase[face] + kU[face] * corner2.x + kV[face] * corner2.y;
+    const vec3 inBlock = kBase[face] + kU[face] * (corner2.x * size.x) + kV[face] * (corner2.y * size.y);
     const vec3 pos = vec3(voxel) + inBlock;
     gl_Position = pc.viewProj * vec4(pos, 1.0);
 
