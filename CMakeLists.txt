@@ -14,6 +14,7 @@ endif()
 option(ENGINE_BUILD_TESTS          "Build unit tests"                               ON)
 option(ENGINE_BUILD_BENCHMARKS     "Build micro-benchmarks"                         ON)
 option(ENGINE_BUILD_SANDBOX        "Build the sandbox executable"                   ON)
+option(ENGINE_BUILD_RENDERER       "Build the Vulkan renderer (needs glslc)"         ON)
 option(ENGINE_ENABLE_TRACY         "Enable the Tracy profiler client"               OFF)
 option(ENGINE_ENABLE_AVX2          "Target AVX2 (x86-64-v3). Steam HW survey: ~95%+" ON)
 option(ENGINE_ENABLE_LTO           "Link-time optimisation in optimised configs"     ON)
@@ -36,7 +37,11 @@ include(Dependencies)      # third-party code via FetchContent (pinned commits)
 
 add_subdirectory(engine)
 
-if(ENGINE_BUILD_SANDBOX)
+if(ENGINE_BUILD_RENDERER)
+    add_subdirectory(renderer)
+endif()
+
+if(ENGINE_BUILD_SANDBOX AND ENGINE_BUILD_RENDERER)
     add_subdirectory(apps/sandbox)
 endif()
 

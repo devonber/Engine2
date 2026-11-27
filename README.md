@@ -12,6 +12,10 @@ A voxel game engine in C++23, built for performance.
    - *Windows 11 SDK* (any recent version)
    - *C++ Clang tools for Windows* (optional, for the `clangcl-release` preset)
 3. Install **Git for Windows** if you don't have it. CMake uses it to download dependencies.
+4. Install the **Vulkan SDK** from https://vulkan.lunarg.com/sdk/home (Windows installer, default options).
+   It provides `glslc` (the shader compiler) and the validation layers. Restart Visual Studio afterwards
+   so it sees the `VULKAN_SDK` environment variable.
+5. Keep your GPU driver up to date: the renderer needs **Vulkan 1.3** (any desktop GPU driver from 2022 on).
 
 There is no `.sln` file. This is a CMake project, and Visual Studio opens it directly:
 
@@ -61,12 +65,40 @@ Build output goes to `out/build/<preset>/bin/`.
 - **Correctness**: hand-optimised code keeps a simple reference version, and tests check that the two
   give identical output (see `tests/test_mesher.cpp`).
 
+## Renderer
+
+Vulkan 1.3, written for throughput:
+
+- **Vertex pulling**: no vertex buffers. Each visible block face is one 8-byte `PackedQuad` in a storage
+  buffer, and the vertex shader expands it into a quad.
+- **One draw call for the whole world**: chunks are frustum-culled on the CPU, which writes one
+  `vkCmdDrawIndexedIndirect` command per visible chunk.
+- **Reversed-Z, infinite far plane** with a 32-bit float depth buffer: even depth precision at any distance.
+- **volk** loads Vulkan functions directly from the driver, skipping the loader's dispatch on each call.
+- **Dynamic rendering + synchronization2**: no render pass or framebuffer objects.
+- **Block textures** live in `assets/textures/*.png` (see the README there), packed into one texture
+  array with CPU-built mipmaps (filtered in linear space). Sampling is nearest-neighbour up close and
+  trilinear + 16x anisotropic at a distance. Which texture goes on which face is set per block in
+  `engine/include/engine/voxel/Blocks.hpp`.
+- Shaders are compiled at build time and embedded in the executable.
+
+Sandbox controls: left-click to capture the mouse, Esc to release; WASD to move, Space/Shift for
+up/down, Ctrl for speed. Frame rate, CPU and GPU times are shown in the title bar.
+
+Sandbox options: `--radius N` (world size in chunks), `--vsync`, `--validation` / `--no-validation`,
+`--camera x,y,z,yawDeg,pitchDeg`, `--assets DIR`, `--frames N` (quit after N frames), `--screenshot file.bmp`.
+
+Validation is on by default in Debug builds. For deeper checks, set these environment variables
+(in Visual Studio: right-click `sandbox.exe` → *Add Debug Configuration* → `"env"`):
+`VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` and `VK_KHRONOS_VALIDATION_VALIDATE_BEST_PRACTICES=true`.
+
 ## Layout
 
 ```
 cmake/            Compiler flags (CompilerOptions.cmake), dependencies (Dependencies.cmake)
 engine/include/   Public headers: engine/core/*, engine/voxel/*
-engine/src/       Engine implementation (static library)
+engine/src/       Engine implementation (static library, no graphics or OS code)
+renderer/         Vulkan renderer, window/input (GLFW), shaders
 apps/sandbox/     Executable for trying things out
 tests/            Unit tests (doctest)
 bench/            Micro-benchmarks (nanobench)
@@ -84,3 +116,4 @@ and nothing needs installing by hand.
 | `ENGINE_ENABLE_TRACY`       | OFF     | Tracy client (ON in `msvc-profile`)            |
 | `ENGINE_ENABLE_SANITIZERS`  | OFF     | ASan (+UBSan on GCC/Clang)                     |
 | `ENGINE_WARNINGS_AS_ERRORS` | OFF     | `/WX` / `-Werror` (CI turns it on)             |
+| `ENGINE_BUILD_RENDERER`     | ON      | Vulkan renderer + windowed sandbox             |

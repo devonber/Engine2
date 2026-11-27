@@ -38,7 +38,11 @@ else()
         -Wall -Wextra -Wpedantic
         -Wshadow -Wnon-virtual-dtor -Wold-style-cast -Wcast-align
         -Woverloaded-virtual -Wnull-dereference -Wdouble-promotion
-        -Wimplicit-fallthrough)
+        -Wimplicit-fallthrough
+        # Fields omitted from designated initializers are zero-initialised by
+        # the language, and the idiomatic way to fill Vulkan structs. GCC 13
+        # still warns about them.
+        -Wno-missing-field-initializers)
     if(ENGINE_WARNINGS_AS_ERRORS)
         target_compile_options(engine_options INTERFACE -Werror)
     endif()

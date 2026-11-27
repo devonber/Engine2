@@ -24,14 +24,14 @@
       "name": "msvc-base",
       "hidden": true,
       "inherits": "windows-base",
-      "cacheVariables": { "CMAKE_CXX_COMPILER": "cl.exe" }
+      "cacheVariables": { "CMAKE_C_COMPILER": "cl.exe", "CMAKE_CXX_COMPILER": "cl.exe" }
     },
     {
       "name": "clangcl-base",
       "hidden": true,
       "inherits": "windows-base",
       "cacheVariables": {
-        "CMAKE_CXX_COMPILER": "clang-cl.exe",
+        "CMAKE_C_COMPILER": "clang-cl.exe", "CMAKE_CXX_COMPILER": "clang-cl.exe",
         "CMAKE_LINKER": "lld-link.exe",
         "CMAKE_AR": "llvm-lib.exe"
       },
@@ -92,26 +92,26 @@
       "name": "linux-gcc-debug",
       "displayName": "GCC Debug",
       "inherits": "linux-base",
-      "cacheVariables": { "CMAKE_CXX_COMPILER": "g++", "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": { "CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++", "CMAKE_BUILD_TYPE": "Debug" }
     },
     {
       "name": "linux-gcc-release",
       "displayName": "GCC Release",
       "inherits": "linux-base",
-      "cacheVariables": { "CMAKE_CXX_COMPILER": "g++", "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": { "CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++", "CMAKE_BUILD_TYPE": "Release" }
     },
     {
       "name": "linux-clang-release",
       "displayName": "Clang Release",
       "inherits": "linux-base",
-      "cacheVariables": { "CMAKE_CXX_COMPILER": "clang++", "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": { "CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++", "CMAKE_BUILD_TYPE": "Release" }
     },
     {
       "name": "linux-gcc-asan",
       "displayName": "GCC Debug + ASan/UBSan",
       "inherits": "linux-base",
       "cacheVariables": {
-        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++",
         "CMAKE_BUILD_TYPE": "Debug",
         "ENGINE_ENABLE_SANITIZERS": "ON"
       }
