@@ -69,6 +69,9 @@ Build output goes to `out/build/<preset>/bin/`.
 
 Vulkan 1.3, written for throughput:
 
+- **Meshing** (`engine/voxel/Mesher.hpp`): visible faces are found 32 voxels at a time with bit operations,
+  faces between neighbouring chunks are culled, and adjacent faces of the same block are merged into
+  rectangles (greedy meshing). On the sandbox world that cuts 2.87M quads to 0.62M (4.6x).
 - **Vertex pulling**: no vertex buffers. Each visible block face is one 8-byte `PackedQuad` in a storage
   buffer, and the vertex shader expands it into a quad.
 - **One draw call for the whole world**: chunks are frustum-culled on the CPU, which writes one
@@ -86,7 +89,7 @@ Sandbox controls: left-click to capture the mouse, Esc to release; WASD to move,
 up/down, Ctrl for speed. Frame rate, CPU and GPU times are shown in the title bar.
 
 Sandbox options: `--radius N` (world size in chunks), `--vsync`, `--validation` / `--no-validation`,
-`--camera x,y,z,yawDeg,pitchDeg`, `--assets DIR`, `--frames N` (quit after N frames), `--screenshot file.bmp`.
+`--camera x,y,z,yawDeg,pitchDeg`, `--assets DIR`, `--mesher greedy|binary`, `--no-border-culling`, `--frames N` (quit after N frames), `--screenshot file.bmp`.
 
 Validation is on by default in Debug builds. For deeper checks, set these environment variables
 (in Visual Studio: right-click `sandbox.exe` → *Add Debug Configuration* → `"env"`):
