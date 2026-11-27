@@ -8,6 +8,10 @@
 #include <array>
 #include <cmath>
 
+#if defined(__AVX2__)
+    #include <immintrin.h>
+#endif
+
 namespace engine::voxel {
 
 namespace {
@@ -66,15 +70,39 @@ void fillTerrain(Chunk& chunk, i32 chunkX, i32 chunkZ)
             std::fill_n(layer, kChunkArea, blocks::Stone); // deep underground: no surface layers
             continue;
         }
-        // Block by depth below the surface (1 = surface block), with bitwise
-        // masks instead of `cond ? a : b`: GCC 13 does not if-convert a chain
-        // of selects, sees "control flow in loop" and runs it scalar (5x slower).
+        // Block by depth below the surface (1 = surface block).
         const i16 y16 = static_cast<i16>(y);
+        u32 i = 0;
+#if defined(__AVX2__)
+        // Explicit AVX2, 16 columns per step: MSVC does not auto-vectorise the
+        // scalar loop below (GCC 13 only does with the bitwise form).
+        const __m256i vy = _mm256_set1_epi16(y16);
+        const __m256i v1 = _mm256_set1_epi16(1);
+        const __m256i v5 = _mm256_set1_epi16(5);
+        const __m256i stone = _mm256_set1_epi16(static_cast<i16>(blocks::Stone));
+        const __m256i dirt = _mm256_set1_epi16(static_cast<i16>(blocks::Dirt));
+        const __m256i grass = _mm256_set1_epi16(static_cast<i16>(blocks::Grass));
+        const __m256i sand = _mm256_set1_epi16(static_cast<i16>(blocks::Sand));
+        for (; i < kChunkArea; i += 16) {
+            const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&height[i]));
+            const __m256i sd = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&sandDepth[i]));
+            const __m256i depth = _mm256_sub_epi16(h, vy);
+            __m256i id = stone;
+            id = _mm256_blendv_epi8(id, dirt, _mm256_cmpgt_epi16(v5, depth));  // depth <= 4
+            id = _mm256_blendv_epi8(id, grass, _mm256_cmpeq_epi16(depth, v1)); // depth == 1
+            id = _mm256_blendv_epi8(sand, id, _mm256_cmpgt_epi16(depth, sd));  // depth <= sandDepth
+            id = _mm256_andnot_si256(_mm256_cmpgt_epi16(v1, depth), id);       // depth <= 0: air
+            static_assert(kAir == 0);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(layer + i), id);
+        }
+#endif
+        // Scalar path (non-AVX2 builds). Bitwise masks, not `cond ? a : b`:
+        // GCC 13 does not if-convert a chain of selects and leaves it scalar.
         const auto blend = [](u16 id, bool cond, u16 value) {
             const u16 m = static_cast<u16>(-static_cast<i16>(cond)); // all ones if cond
             return static_cast<u16>((id & ~m) | (value & m));
         };
-        for (u32 i = 0; i < kChunkArea; ++i) {
+        for (; i < kChunkArea; ++i) {
             const i16 depth = static_cast<i16>(height[i] - y16);
             u16 id = blocks::Stone;
             id = blend(id, depth <= 4, blocks::Dirt);

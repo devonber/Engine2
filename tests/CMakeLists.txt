@@ -1,5 +1,6 @@
 add_executable(engine_tests
     main.cpp
+    test_bits.cpp
     test_chunk.cpp
     test_mesher.cpp
     test_thread_pool.cpp
