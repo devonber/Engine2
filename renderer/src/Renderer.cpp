@@ -1,0 +1,714 @@
+#include "engine/render/Renderer.hpp"
+
+#include "engine/core/Profile.hpp"
+#include "engine/platform/Window.hpp"
+#include "engine/render/Camera.hpp"
+
+#include <cstring>
+#include <fstream>
+#include <vector>
+
+namespace engine::render {
+
+namespace {
+
+// SPIR-V compiled from renderer/shaders at build time and embedded, so the
+// executable has no shader files to find at runtime.
+constexpr u32 kVoxelVertSpv[] =
+#include "voxel.vert.spv.inc"
+    ;
+constexpr u32 kVoxelFragSpv[] =
+#include "voxel.frag.spv.inc"
+    ;
+
+constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+
+// Densest possible chunk is a 3D checkerboard: half the voxels solid, all 6 faces visible.
+constexpr u32 kMaxQuadsPerChunk = voxel::kChunkVolume / 2 * 6;
+
+// Sky colour, linear. Also the fog colour so distant terrain fades into it.
+constexpr f32 kSky[3] = {0.36f, 0.58f, 0.92f};
+
+struct PushConstants {
+    glm::mat4 viewProj;
+    glm::vec4 cameraPos;
+    glm::vec4 fog;
+};
+static_assert(sizeof(PushConstants) <= 128, "128 bytes is the guaranteed minimum push constant size");
+
+VkShaderModule createShaderModule(VkDevice device, std::span<const u32> spirv)
+{
+    const VkShaderModuleCreateInfo info{
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = spirv.size_bytes(),
+        .pCode = spirv.data(),
+    };
+    VkShaderModule module = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateShaderModule(device, &info, nullptr, &module));
+    return module;
+}
+
+VkImageMemoryBarrier2 imageBarrier(VkImage image, VkImageAspectFlags aspect, VkPipelineStageFlags2 srcStage,
+                                   VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
+                                   VkImageLayout oldLayout, VkImageLayout newLayout)
+{
+    return VkImageMemoryBarrier2{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = srcStage,
+        .srcAccessMask = srcAccess,
+        .dstStageMask = dstStage,
+        .dstAccessMask = dstAccess,
+        .oldLayout = oldLayout,
+        .newLayout = newLayout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange = {aspect, 0, 1, 0, 1},
+    };
+}
+
+void pipelineBarriers(VkCommandBuffer cmd, std::span<const VkImageMemoryBarrier2> barriers)
+{
+    const VkDependencyInfo dep{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+        .pImageMemoryBarriers = barriers.data(),
+    };
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+} // namespace
+
+Renderer::Renderer(VulkanContext& ctx, platform::Window& window, const RendererDesc& desc)
+    : m_ctx(ctx), m_window(window), m_desc(desc)
+{
+    VkDevice device = m_ctx.device();
+    const platform::Extent e = m_window.framebufferExtent();
+    m_swapchain = std::make_unique<Swapchain>(m_ctx, VkExtent2D{e.width, e.height}, desc.presentMode);
+    createDepth();
+
+    // Descriptor set: quad buffer + chunk origins, both read by the vertex shader.
+    const VkDescriptorSetLayoutBinding bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+    };
+    const VkDescriptorSetLayoutCreateInfo layoutInfo{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 2,
+        .pBindings = bindings,
+    };
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_setLayout));
+
+    const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+    const VkDescriptorPoolCreateInfo poolInfo{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &poolSize,
+    };
+    VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_descriptorPool));
+    const VkDescriptorSetAllocateInfo setInfo{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = m_descriptorPool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &m_setLayout,
+    };
+    VK_CHECK(vkAllocateDescriptorSets(device, &setInfo, &m_set));
+
+    const VkPushConstantRange pushRange{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                        sizeof(PushConstants)};
+    const VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &m_setLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushRange,
+    };
+    VK_CHECK(vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout));
+    createPipeline();
+    createIndexBuffer();
+
+    for (Frame& f : m_frames) {
+        const VkCommandPoolCreateInfo cmdPoolInfo{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            .queueFamilyIndex = m_ctx.queueFamily(),
+        };
+        VK_CHECK(vkCreateCommandPool(device, &cmdPoolInfo, nullptr, &f.pool));
+        const VkCommandBufferAllocateInfo cmdInfo{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = f.pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VK_CHECK(vkAllocateCommandBuffers(device, &cmdInfo, &f.cmd));
+
+        const VkFenceCreateInfo fenceInfo{
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .flags = VK_FENCE_CREATE_SIGNALED_BIT, // first wait returns immediately
+        };
+        VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &f.inFlight));
+        const VkSemaphoreCreateInfo semInfo{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VK_CHECK(vkCreateSemaphore(device, &semInfo, nullptr, &f.imageAcquired));
+    }
+
+    const VkQueryPoolCreateInfo queryInfo{
+        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP,
+        .queryCount = 2 * kFramesInFlight,
+    };
+    VK_CHECK(vkCreateQueryPool(device, &queryInfo, nullptr, &m_queryPool));
+}
+
+Renderer::~Renderer()
+{
+    VkDevice device = m_ctx.device();
+    vkDeviceWaitIdle(device);
+
+    for (Frame& f : m_frames) {
+        destroyBuffer(m_ctx.allocator(), f.indirect);
+        vkDestroySemaphore(device, f.imageAcquired, nullptr);
+        vkDestroyFence(device, f.inFlight, nullptr);
+        vkDestroyCommandPool(device, f.pool, nullptr);
+    }
+    vkDestroyQueryPool(device, m_queryPool, nullptr);
+    destroyWorld();
+    destroyBuffer(m_ctx.allocator(), m_indexBuffer);
+    destroyBuffer(m_ctx.allocator(), m_screenshotBuffer);
+    vkDestroyPipeline(device, m_pipeline, nullptr);
+    vkDestroyPipelineLayout(device, m_pipelineLayout, nullptr);
+    vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
+    vkDestroyDescriptorSetLayout(device, m_setLayout, nullptr);
+    destroyDepth();
+    m_swapchain.reset();
+}
+
+void Renderer::createPipeline()
+{
+    VkDevice device = m_ctx.device();
+    if (m_pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, m_pipeline, nullptr);
+    }
+
+    VkShaderModule vert = createShaderModule(device, kVoxelVertSpv);
+    VkShaderModule frag = createShaderModule(device, kVoxelFragSpv);
+
+    const VkPipelineShaderStageCreateInfo stages[] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vert,
+         .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = frag,
+         .pName = "main"},
+    };
+    const VkPipelineVertexInputStateCreateInfo vertexInput{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO}; // vertex pulling: no attributes
+    const VkPipelineInputAssemblyStateCreateInfo inputAssembly{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    };
+    const VkPipelineViewportStateCreateInfo viewport{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .scissorCount = 1,
+    };
+    const VkPipelineRasterizationStateCreateInfo raster{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .cullMode = VK_CULL_MODE_BACK_BIT,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .lineWidth = 1.0f,
+    };
+    const VkPipelineMultisampleStateCreateInfo multisample{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+    };
+    const VkPipelineDepthStencilStateCreateInfo depth{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = VK_TRUE,
+        .depthWriteEnable = VK_TRUE,
+        .depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL, // reversed Z: nearer = larger
+    };
+    const VkPipelineColorBlendAttachmentState blendAttachment{
+        .colorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+    const VkPipelineColorBlendStateCreateInfo blend{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments = &blendAttachment,
+    };
+    const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    const VkPipelineDynamicStateCreateInfo dynamic{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 2,
+        .pDynamicStates = dynamicStates,
+    };
+
+    m_pipelineColorFormat = m_swapchain->format();
+    // Dynamic rendering (Vulkan 1.3): attachment formats instead of a VkRenderPass.
+    const VkPipelineRenderingCreateInfo rendering{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &m_pipelineColorFormat,
+        .depthAttachmentFormat = kDepthFormat,
+    };
+
+    const VkGraphicsPipelineCreateInfo info{
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = &rendering,
+        .stageCount = 2,
+        .pStages = stages,
+        .pVertexInputState = &vertexInput,
+        .pInputAssemblyState = &inputAssembly,
+        .pViewportState = &viewport,
+        .pRasterizationState = &raster,
+        .pMultisampleState = &multisample,
+        .pDepthStencilState = &depth,
+        .pColorBlendState = &blend,
+        .pDynamicState = &dynamic,
+        .layout = m_pipelineLayout,
+    };
+    VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &m_pipeline));
+
+    vkDestroyShaderModule(device, vert, nullptr);
+    vkDestroyShaderModule(device, frag, nullptr);
+}
+
+void Renderer::createDepth()
+{
+    const VkExtent2D extent = m_swapchain->extent();
+    const VkImageCreateInfo imageInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = kDepthFormat,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    const VmaAllocationCreateInfo allocInfo{
+        .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT, // render targets prefer their own allocation
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+    VK_CHECK(vmaCreateImage(m_ctx.allocator(), &imageInfo, &allocInfo, &m_depthImage, &m_depthAllocation, nullptr));
+
+    const VkImageViewCreateInfo viewInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = m_depthImage,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = kDepthFormat,
+        .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+    };
+    VK_CHECK(vkCreateImageView(m_ctx.device(), &viewInfo, nullptr, &m_depthView));
+}
+
+void Renderer::destroyDepth()
+{
+    vkDestroyImageView(m_ctx.device(), m_depthView, nullptr);
+    vmaDestroyImage(m_ctx.allocator(), m_depthImage, m_depthAllocation);
+    m_depthView = VK_NULL_HANDLE;
+    m_depthImage = VK_NULL_HANDLE;
+    m_depthAllocation = nullptr;
+}
+
+void Renderer::createIndexBuffer()
+{
+    // Quad q uses corners 4q..4q+3 as triangles (0,1,2) and (2,1,3). Each
+    // chunk's draw starts at index 0 and offsets vertices with vertexOffset, so
+    // one buffer sized for the densest chunk serves every draw.
+    std::vector<u32> indices(static_cast<usize>(kMaxQuadsPerChunk) * 6);
+    for (u32 q = 0; q < kMaxQuadsPerChunk; ++q) {
+        const u32 v = q * 4;
+        u32* dst = &indices[static_cast<usize>(q) * 6];
+        dst[0] = v + 0;
+        dst[1] = v + 1;
+        dst[2] = v + 2;
+        dst[3] = v + 2;
+        dst[4] = v + 1;
+        dst[5] = v + 3;
+    }
+    m_indexBuffer =
+        createBufferWithData(m_ctx, indices.data(), indices.size() * sizeof(u32), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+}
+
+void Renderer::destroyWorld()
+{
+    destroyBuffer(m_ctx.allocator(), m_quadBuffer);
+    destroyBuffer(m_ctx.allocator(), m_chunkBuffer);
+    m_chunks.clear();
+}
+
+void Renderer::uploadWorld(std::span<const voxel::PackedQuad> quads, std::span<const ChunkDraw> chunks)
+{
+    ENGINE_PROFILE_FUNCTION();
+    vkDeviceWaitIdle(m_ctx.device());
+    destroyWorld();
+    if (quads.empty() || chunks.empty()) {
+        return;
+    }
+
+    m_chunks.assign(chunks.begin(), chunks.end());
+    std::vector<glm::ivec4> origins;
+    origins.reserve(chunks.size());
+    for (const ChunkDraw& c : chunks) {
+        ENGINE_ASSERT(c.quadCount <= kMaxQuadsPerChunk);
+        origins.emplace_back(c.originX, c.originY, c.originZ, 0);
+    }
+
+    m_quadBuffer = createBufferWithData(m_ctx, quads.data(), quads.size_bytes(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    m_chunkBuffer = createBufferWithData(m_ctx, origins.data(), origins.size() * sizeof(glm::ivec4),
+                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    const VkDescriptorBufferInfo bufferInfos[] = {
+        {m_quadBuffer.buffer, 0, VK_WHOLE_SIZE},
+        {m_chunkBuffer.buffer, 0, VK_WHOLE_SIZE},
+    };
+    VkWriteDescriptorSet writes[2];
+    for (u32 i = 0; i < 2; ++i) {
+        writes[i] = VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = m_set,
+            .dstBinding = i,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &bufferInfos[i],
+        };
+    }
+    vkUpdateDescriptorSets(m_ctx.device(), 2, writes, 0, nullptr);
+
+    // Per-frame indirect buffers sized for the worst case (every chunk visible).
+    for (Frame& f : m_frames) {
+        destroyBuffer(m_ctx.allocator(), f.indirect);
+        f.indirect = createBuffer(m_ctx.allocator(), chunks.size() * sizeof(VkDrawIndexedIndirectCommand),
+                                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, MemoryKind::Upload);
+    }
+}
+
+void Renderer::recreateSwapchain()
+{
+    m_window.waitWhileMinimised();
+    vkDeviceWaitIdle(m_ctx.device());
+    const platform::Extent e = m_window.framebufferExtent();
+    m_swapchain->recreate({e.width, e.height});
+    destroyDepth();
+    createDepth();
+    if (m_swapchain->format() != m_pipelineColorFormat) {
+        createPipeline();
+    }
+}
+
+u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, u64& drawnQuads) const
+{
+    ENGINE_PROFILE_FUNCTION();
+    if (m_chunks.empty()) {
+        return 0;
+    }
+    const VkExtent2D extent = m_swapchain->extent();
+    const f32 aspect = static_cast<f32>(extent.width) / static_cast<f32>(extent.height);
+    const Frustum frustum = Frustum::fromViewProj(camera.projection(aspect) * camera.view());
+    const f32 maxDistSq = (m_desc.fogDistance + 56.0f) * (m_desc.fogDistance + 56.0f); // fully fogged beyond
+
+    auto* cmds = static_cast<VkDrawIndexedIndirectCommand*>(frame.indirect.mapped);
+    u32 count = 0;
+    constexpr f32 kSize = static_cast<f32>(voxel::kChunkSize);
+    for (u32 i = 0; i < m_chunks.size(); ++i) {
+        const ChunkDraw& c = m_chunks[i];
+        if (c.quadCount == 0) {
+            continue;
+        }
+        const glm::vec3 min{static_cast<f32>(c.originX), static_cast<f32>(c.originY), static_cast<f32>(c.originZ)};
+        const glm::vec3 max = min + kSize;
+        const glm::vec3 centre = (min + max) * 0.5f;
+        const glm::vec3 d = centre - camera.position;
+        if (glm::dot(d, d) > maxDistSq || !frustum.intersects(min, max)) {
+            continue;
+        }
+        cmds[count++] = VkDrawIndexedIndirectCommand{
+            .indexCount = c.quadCount * 6,
+            .instanceCount = 1,
+            .firstIndex = 0,
+            .vertexOffset = static_cast<i32>(c.firstQuad * 4),
+            .firstInstance = i,
+        };
+        drawnQuads += c.quadCount;
+    }
+    VK_CHECK(vmaFlushAllocation(m_ctx.allocator(), frame.indirect.allocation, 0, VK_WHOLE_SIZE));
+    return count;
+}
+
+f64 Renderer::readGpuTime(u32 frameIndex) const
+{
+    u64 ts[2] = {};
+    const VkResult r = vkGetQueryPoolResults(m_ctx.device(), m_queryPool, frameIndex * 2, 2, sizeof(ts), ts,
+                                             sizeof(u64), VK_QUERY_RESULT_64_BIT);
+    if (r != VK_SUCCESS) {
+        return 0.0;
+    }
+    const f64 ticks = static_cast<f64>(ts[1] - ts[0]);
+    return ticks * static_cast<f64>(m_ctx.properties().limits.timestampPeriod) * 1e-6;
+}
+
+FrameStats Renderer::renderFrame(const Camera& camera)
+{
+    ENGINE_PROFILE_FUNCTION();
+    VkDevice device = m_ctx.device();
+    Frame& frame = m_frames[m_frameIndex];
+    FrameStats stats;
+
+    {
+        ENGINE_PROFILE_SCOPE("waitForFrameFence");
+        VK_CHECK(vkWaitForFences(device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX));
+    }
+    if (frame.timestampsWritten) {
+        stats.gpuMs = readGpuTime(m_frameIndex);
+    }
+
+    if (m_window.consumeResized()) {
+        recreateSwapchain();
+    }
+
+    u32 imageIndex = 0;
+    VkResult acquire = vkAcquireNextImageKHR(device, m_swapchain->handle(), UINT64_MAX, frame.imageAcquired,
+                                             VK_NULL_HANDLE, &imageIndex);
+    if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
+        recreateSwapchain();
+        return stats; // the semaphore was not signalled; try again next frame
+    }
+    if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
+        VK_CHECK(acquire);
+    }
+    VK_CHECK(vkResetFences(device, 1, &frame.inFlight));
+
+    u64 drawnQuads = 0;
+    const u32 drawCount = cullAndWriteDraws(frame, camera, drawnQuads);
+    stats.drawnChunks = drawCount;
+    stats.drawnQuads = drawnQuads;
+
+    const bool screenshot = !m_screenshotPath.empty();
+    recordFrame(frame, imageIndex, drawCount, camera, screenshot);
+
+    const VkSemaphoreSubmitInfo waitInfo{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .semaphore = frame.imageAcquired,
+        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+    };
+    VkSemaphore renderFinished = m_swapchain->renderFinished(imageIndex);
+    const VkSemaphoreSubmitInfo signalInfo{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .semaphore = renderFinished,
+        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+    };
+    const VkCommandBufferSubmitInfo cmdInfo{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .commandBuffer = frame.cmd,
+    };
+    const VkSubmitInfo2 submit{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .waitSemaphoreInfoCount = 1,
+        .pWaitSemaphoreInfos = &waitInfo,
+        .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &cmdInfo,
+        .signalSemaphoreInfoCount = 1,
+        .pSignalSemaphoreInfos = &signalInfo,
+    };
+    VK_CHECK(vkQueueSubmit2(m_ctx.queue(), 1, &submit, frame.inFlight));
+    frame.timestampsWritten = true;
+
+    if (screenshot) {
+        VK_CHECK(vkWaitForFences(device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX));
+        writeScreenshot();
+    }
+
+    VkSwapchainKHR swapchain = m_swapchain->handle();
+    const VkPresentInfoKHR present{
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &renderFinished,
+        .swapchainCount = 1,
+        .pSwapchains = &swapchain,
+        .pImageIndices = &imageIndex,
+    };
+    const VkResult presentResult = vkQueuePresentKHR(m_ctx.queue(), &present);
+    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
+        recreateSwapchain();
+    } else if (presentResult != VK_SUCCESS) {
+        VK_CHECK(presentResult);
+    }
+
+    m_frameIndex = (m_frameIndex + 1) % kFramesInFlight;
+    return stats;
+}
+
+void Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Camera& camera, bool screenshot)
+{
+    ENGINE_PROFILE_FUNCTION();
+    VkCommandBuffer cmd = frame.cmd;
+    VK_CHECK(vkResetCommandPool(m_ctx.device(), frame.pool, 0));
+    const VkCommandBufferBeginInfo begin{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
+
+    const u32 query = m_frameIndex * 2;
+    vkCmdResetQueryPool(cmd, m_queryPool, query, 2);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, query);
+
+    VkImage colorImage = m_swapchain->image(imageIndex);
+    const VkExtent2D extent = m_swapchain->extent();
+
+    // Old contents are discarded (UNDEFINED); both images are cleared on load.
+    // The depth barrier also orders against the previous frame's depth writes,
+    // since one depth image is shared by all frames in flight.
+    const VkImageMemoryBarrier2 toRender[] = {
+        imageBarrier(colorImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL),
+        imageBarrier(m_depthImage, VK_IMAGE_ASPECT_DEPTH_BIT, VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL),
+    };
+    pipelineBarriers(cmd, toRender);
+
+    const VkRenderingAttachmentInfo colorAttachment{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = m_swapchain->view(imageIndex),
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = {.color = {{kSky[0], kSky[1], kSky[2], 1.0f}}},
+    };
+    const VkRenderingAttachmentInfo depthAttachment{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = m_depthView,
+        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, // depth is not needed after the pass
+        .clearValue = {.depthStencil = {0.0f, 0}},   // reversed Z: 0 is infinitely far
+    };
+    const VkRenderingInfo renderingInfo{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = {{0, 0}, extent},
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &colorAttachment,
+        .pDepthAttachment = &depthAttachment,
+    };
+    vkCmdBeginRendering(cmd, &renderingInfo);
+
+    if (drawCount > 0) {
+        const VkViewport viewport{0.0f, 0.0f, static_cast<f32>(extent.width), static_cast<f32>(extent.height),
+                                  0.0f, 1.0f};
+        const VkRect2D scissor{{0, 0}, extent};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        const f32 aspect = static_cast<f32>(extent.width) / static_cast<f32>(extent.height);
+        const PushConstants pc{
+            .viewProj = camera.projection(aspect) * camera.view(),
+            .cameraPos = glm::vec4{camera.position, 0.0f},
+            .fog = glm::vec4{kSky[0], kSky[1], kSky[2], m_desc.fogDistance},
+        };
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_set, 0, nullptr);
+        vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(pc), &pc);
+        vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+        // The whole visible world in one call.
+        vkCmdDrawIndexedIndirect(cmd, frame.indirect.buffer, 0, drawCount, sizeof(VkDrawIndexedIndirectCommand));
+    }
+    vkCmdEndRendering(cmd);
+
+    // Transition to PRESENT_SRC. The destination stage must be a real stage
+    // (not NONE) so the transition is ordered before the semaphore signal
+    // that presentation waits on.
+    if (screenshot) {
+        const VkDeviceSize size = static_cast<VkDeviceSize>(extent.width) * extent.height * 4;
+        if (m_screenshotBuffer.size < size) {
+            destroyBuffer(m_ctx.allocator(), m_screenshotBuffer);
+            m_screenshotBuffer =
+                createBuffer(m_ctx.allocator(), size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemoryKind::Readback);
+        }
+        const VkImageMemoryBarrier2 toCopy = imageBarrier(
+            colorImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        pipelineBarriers(cmd, {&toCopy, 1});
+        const VkBufferImageCopy region{
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .imageExtent = {extent.width, extent.height, 1},
+        };
+        vkCmdCopyImageToBuffer(cmd, colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_screenshotBuffer.buffer, 1,
+                               &region);
+        const VkImageMemoryBarrier2 toPresent = imageBarrier(
+            colorImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, 0,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        pipelineBarriers(cmd, {&toPresent, 1});
+    } else {
+        const VkImageMemoryBarrier2 toPresent =
+            imageBarrier(colorImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        pipelineBarriers(cmd, {&toPresent, 1});
+    }
+
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, m_queryPool, query + 1);
+    VK_CHECK(vkEndCommandBuffer(cmd));
+}
+
+void Renderer::writeScreenshot()
+{
+    const VkExtent2D extent = m_swapchain->extent();
+    VK_CHECK(vmaInvalidateAllocation(m_ctx.allocator(), m_screenshotBuffer.allocation, 0, VK_WHOLE_SIZE));
+    const auto* pixels = static_cast<const u8*>(m_screenshotBuffer.mapped);
+    const bool bgra =
+        m_swapchain->format() == VK_FORMAT_B8G8R8A8_SRGB || m_swapchain->format() == VK_FORMAT_B8G8R8A8_UNORM;
+
+    // 24-bit BMP: rows bottom-up, BGR, each row padded to 4 bytes.
+    const u32 w = extent.width;
+    const u32 h = extent.height;
+    const u32 rowBytes = (w * 3 + 3) & ~3u;
+    const u32 dataSize = rowBytes * h;
+    u8 header[54] = {'B', 'M'};
+    const auto put32 = [&](usize at, u32 v) {
+        for (usize i = 0; i < 4; ++i) {
+            header[at + i] = static_cast<u8>(v >> (8 * i));
+        }
+    };
+    put32(2, 54 + dataSize); // file size
+    put32(10, 54);           // pixel data offset
+    put32(14, 40);           // BITMAPINFOHEADER size
+    put32(18, w);
+    put32(22, h);
+    header[26] = 1;  // planes
+    header[28] = 24; // bits per pixel
+    put32(34, dataSize);
+
+    std::vector<u8> data(dataSize, 0);
+    for (u32 y = 0; y < h; ++y) {
+        const u8* src = pixels + static_cast<usize>(h - 1 - y) * w * 4;
+        u8* dst = data.data() + static_cast<usize>(y) * rowBytes;
+        for (u32 x = 0; x < w; ++x) {
+            const u8* p = src + static_cast<usize>(x) * 4;
+            dst[x * 3 + 0] = bgra ? p[0] : p[2];
+            dst[x * 3 + 1] = p[1];
+            dst[x * 3 + 2] = bgra ? p[2] : p[0];
+        }
+    }
+
+    std::ofstream file(m_screenshotPath, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(header), sizeof(header));
+    file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    std::fprintf(stderr, "Screenshot written to %s\n", m_screenshotPath.c_str());
+    m_screenshotPath.clear();
+}
+
+} // namespace engine::render
