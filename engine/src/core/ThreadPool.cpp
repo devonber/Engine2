@@ -62,20 +62,52 @@ void ThreadPool::process(const Task& task)
     }
 }
 
+void ThreadPool::submit(Job job)
+{
+    if (m_threads.empty()) {
+        job();
+        return;
+    }
+    {
+        std::lock_guard lock(m_mutex);
+        m_jobs.push_back(std::move(job));
+    }
+    m_wake.notify_one();
+}
+
+u32 ThreadPool::queuedJobs() const
+{
+    std::lock_guard lock(m_mutex);
+    return static_cast<u32>(m_jobs.size());
+}
+
 void ThreadPool::workerLoop()
 {
     u64 seen = 0;
     for (;;) {
         Task task;
+        Job job;
         {
             std::unique_lock lock(m_mutex);
-            m_wake.wait(lock, [&] { return m_stop || m_generation != seen; });
+            m_wake.wait(lock, [&] { return m_stop || m_generation != seen || !m_jobs.empty(); });
             if (m_stop) {
                 return;
             }
-            seen = m_generation;
-            task = m_task;
-            ++m_busy; // run() cannot return (or start another task) until we are done
+            if (m_generation != seen) {
+                // A parallelFor takes priority over queued jobs.
+                seen = m_generation;
+                task = m_task;
+                ++m_busy; // run() cannot return (or start another task) until we are done
+            } else {
+                job = std::move(m_jobs.front());
+                m_jobs.pop_front();
+            }
+        }
+
+        if (job) {
+            ENGINE_PROFILE_SCOPE("ThreadPool job");
+            job();
+            continue;
         }
 
         {

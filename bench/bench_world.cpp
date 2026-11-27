@@ -1,4 +1,5 @@
 #include "engine/core/ThreadPool.hpp"
+#include "engine/voxel/ChunkStreamer.hpp"
 #include "engine/voxel/Generate.hpp"
 #include "engine/voxel/World.hpp"
 
@@ -33,4 +34,18 @@ void runWorldBenchmarks()
     char name[32];
     std::snprintf(name, sizeof(name), "%u threads", pool.concurrency());
     b.run(name, [&] { ankerl::nanobench::doNotOptimizeAway(buildTerrainWorld(options, &pool).quads.size()); });
+
+    // Streaming, without a renderer: how fast the area around a fresh centre
+    // is generated and meshed when the main loop spins freely.
+    ankerl::nanobench::Bench s;
+    s.title("stream in radius 12 (529 generated, 441 meshed)").unit("area").warmup(1).epochs(5).epochIterations(1);
+    i32 x = 0;
+    s.run(name, [&] {
+        ChunkStreamer streamer(pool, {.viewRadius = 12});
+        x += 1000; // fresh area every time
+        do {
+            streamer.update({x, 0});
+            ankerl::nanobench::doNotOptimizeAway(streamer.takeMeshEvents().size());
+        } while (!streamer.settled());
+    });
 }

@@ -1,19 +1,20 @@
-// Sandbox: generates a patch of terrain, meshes it, and flies a camera over it.
+// Sandbox: an endless streamed terrain to fly over. Chunks around the camera
+// are generated and meshed on background threads and uploaded as they finish.
 //
 // Controls: left-click to capture the mouse, Esc to release it.
 //           WASD move, Space/Shift up/down, Ctrl to go fast.
 //
-// Options:  --radius N        world radius in chunks (default 12 -> 24x24 chunks)
+// Options:  --radius N        view radius in chunks (default 12)
 //           --vsync           cap to display refresh (default: uncapped)
 //           --validation      force the Vulkan validation layer on (always on in Debug)
 //           --no-validation   force it off
-//           --frames N        quit after N frames (for automated runs)
-//           --screenshot F    save frame N-1 (needs --frames) or frame 60 to F (.bmp)
+//           --frames N        quit N frames after the initial area has loaded (automated runs)
+//           --screenshot F    save the last of those frames (or frame 60) to F (.bmp)
+//           --fly SPEED       fly forward automatically at SPEED blocks/s once loaded
 //           --camera x,y,z,yaw,pitch   start position (yaw/pitch in degrees)
 //           --assets DIR      asset folder (default: <repo>/assets)
 //           --mesher M        greedy (default) or binary (one quad per block face)
-//           --no-border-culling   draw faces between chunks (for comparison)
-//           --threads N       threads for world building (default: all; 1 = main thread only)
+//           --threads N       threads in total for background work (default: all hardware threads)
 
 #include "engine/core/Profile.hpp"
 #include "engine/core/ThreadPool.hpp"
@@ -22,7 +23,7 @@
 #include "engine/render/Camera.hpp"
 #include "engine/render/Renderer.hpp"
 #include "engine/voxel/Blocks.hpp"
-#include "engine/voxel/World.hpp"
+#include "engine/voxel/ChunkStreamer.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -47,8 +48,8 @@ struct Options {
     std::string screenshot;
     std::string assets = ENGINE_ASSET_DIR;
     bool greedy = true;
-    bool borderCulling = true;
     u32 threads = 0; // 0 = all hardware threads
+    f32 fly = 0.0f;
     f32 camera[5] = {0.0f, 45.0f, 40.0f, 0.0f, -20.0f};
 };
 
@@ -74,8 +75,8 @@ Options parseArgs(int argc, char** argv)
             o.greedy = std::strcmp(next(), "binary") != 0;
         } else if (arg("--threads")) {
             o.threads = static_cast<u32>(std::clamp(std::atoi(next()), 0, 256));
-        } else if (arg("--no-border-culling")) {
-            o.borderCulling = false;
+        } else if (arg("--fly")) {
+            o.fly = static_cast<f32>(std::atof(next()));
         } else if (arg("--assets")) {
             o.assets = next();
         } else if (arg("--camera")) {
@@ -142,50 +143,34 @@ int main(int argc, char** argv)
                      textures.textures.size, textures.textures.size, textures.textures.mipLevels,
                      std::chrono::duration<f64, std::milli>(Clock::now() - t0).count());
     }
-    {
-        const auto t0 = Clock::now();
-        // 1 thread = everything on the main thread (no pool) for comparison.
-        std::unique_ptr<ThreadPool> pool;
-        if (opt.threads != 1) {
-            pool = std::make_unique<ThreadPool>(opt.threads == 0 ? 0u : opt.threads - 1);
-        }
-        const voxel::WorldMesh world = voxel::buildTerrainWorld(
-            {.radius = opt.radius, .greedy = opt.greedy, .borderCulling = opt.borderCulling}, pool.get());
-
-        std::vector<render::ChunkDraw> draws;
-        draws.reserve(world.chunks.size());
-        constexpr i32 n = static_cast<i32>(voxel::kChunkSize);
-        for (const voxel::ChunkMeshRange& c : world.chunks) {
-            draws.push_back({c.chunkX * n, 0, c.chunkZ * n, c.firstQuad, c.quadCount});
-        }
-        const auto t1 = Clock::now();
-        renderer.uploadWorld(world.quads, draws);
-        const auto t2 = Clock::now();
-        std::fprintf(stderr,
-                     "World (%s mesher, border culling %s, %u threads): %zu chunks, %zu quads (%.1f MiB)\n"
-                     "  generate %.1f ms, mesh %.1f ms, total build %.1f ms, upload %.1f ms\n",
-                     opt.greedy ? "greedy" : "binary", opt.borderCulling ? "on" : "off",
-                     pool ? pool->concurrency() : 1u, world.chunks.size(), world.quads.size(),
-                     static_cast<f64>(world.quads.size() * sizeof(voxel::PackedQuad)) / (1024.0 * 1024.0),
-                     world.generateMs, world.meshMs, std::chrono::duration<f64, std::milli>(t1 - t0).count(),
-                     std::chrono::duration<f64, std::milli>(t2 - t1).count());
-    }
+    // Background workers for generation and meshing. --threads counts the
+    // main thread too, so the pool gets one fewer.
+    ThreadPool pool(opt.threads == 0 ? 0u : std::max(opt.threads, 2u) - 1);
+    voxel::ChunkStreamer streamer(pool, {.viewRadius = opt.radius, .greedy = opt.greedy});
+    std::fprintf(stderr, "Streaming: view radius %d chunks, %u worker threads, %s meshing\n", opt.radius,
+                 pool.workerCount(), opt.greedy ? "greedy" : "binary");
 
     render::Camera camera;
     camera.position = {opt.camera[0], opt.camera[1], opt.camera[2]};
     camera.yaw = glm::radians(opt.camera[3]);
     camera.pitch = glm::radians(opt.camera[4]);
 
-    const i64 screenshotFrame = opt.screenshot.empty() ? -1 : (opt.frames > 0 ? opt.frames - 1 : 60);
-
     // Title-bar stats, averaged over half a second.
     auto statsStart = Clock::now();
-    f64 cpuAccumMs = 0.0, gpuAccumMs = 0.0;
+    f64 cpuAccumMs = 0.0, gpuAccumMs = 0.0, streamAccumMs = 0.0;
+    u64 uploadAccum = 0;
     u32 statFrames = 0;
 
+    // Automated runs (--frames) count frames from when the initial area has
+    // finished loading, so screenshots and timings do not depend on load speed.
+    const auto start = Clock::now();
+    bool loaded = false;
+    i64 framesAfterLoad = 0;
+    const i64 screenshotFrame = opt.screenshot.empty() ? -1 : (opt.frames > 0 ? opt.frames - 1 : 60);
+
     auto last = Clock::now();
-    for (i64 frame = 0; !window.shouldClose(); ++frame) {
-        if (opt.frames >= 0 && frame >= opt.frames) {
+    while (!window.shouldClose()) {
+        if (loaded && opt.frames >= 0 && framesAfterLoad >= opt.frames) {
             break;
         }
         window.pollEvents();
@@ -194,7 +179,35 @@ int main(int argc, char** argv)
         last = now;
 
         updateCamera(camera, window.input(), dt);
-        if (frame == screenshotFrame) {
+        if (loaded && opt.fly > 0.0f) {
+            const glm::vec3 flat = glm::normalize(glm::vec3{std::sin(camera.yaw), 0.0f, -std::cos(camera.yaw)});
+            camera.position += flat * opt.fly * dt;
+        }
+
+        // Streaming: schedule work around the camera, hand finished meshes to the GPU.
+        const auto streamStart = Clock::now();
+        const voxel::ChunkCoord centre = voxel::chunkAt(camera.position.x, camera.position.z);
+        streamer.update(centre);
+        for (voxel::ChunkMeshEvent& e : streamer.takeMeshEvents()) {
+            if (e.removed) {
+                renderer.removeChunkMesh(e.coord.key());
+            } else {
+                constexpr i32 n = static_cast<i32>(voxel::kChunkSize);
+                renderer.setChunkMesh(e.coord.key(), {e.coord.x * n, 0, e.coord.z * n}, std::move(e.quads));
+            }
+        }
+        streamAccumMs += std::chrono::duration<f64, std::milli>(Clock::now() - streamStart).count();
+
+        if (!loaded && streamer.settled() && renderer.meshStats().pendingBytes == 0) {
+            loaded = true;
+            const voxel::ChunkStreamer::Stats ss = streamer.stats();
+            const render::MeshMemoryStats ms = renderer.meshStats();
+            std::fprintf(
+                stderr, "Initial area loaded in %.1f ms: %u chunks generated, %u meshed, %.2fM quads (%.1f MiB)\n",
+                std::chrono::duration<f64, std::milli>(Clock::now() - start).count(), ss.loadedChunks, ss.meshedChunks,
+                static_cast<f64>(ms.quads) / 1e6, static_cast<f64>(ms.usedBytes) / (1024.0 * 1024.0));
+        }
+        if (loaded && framesAfterLoad == screenshotFrame) {
             renderer.requestScreenshot(opt.screenshot);
         }
 
@@ -202,21 +215,34 @@ int main(int argc, char** argv)
         const render::FrameStats stats = renderer.renderFrame(camera);
         cpuAccumMs += std::chrono::duration<f64, std::milli>(Clock::now() - cpuStart).count();
         gpuAccumMs += stats.gpuMs;
+        uploadAccum += stats.uploadedBytes;
         ++statFrames;
+        if (loaded) {
+            ++framesAfterLoad;
+        }
         ENGINE_PROFILE_FRAME();
 
         const f64 elapsed = std::chrono::duration<f64>(Clock::now() - statsStart).count();
         if (elapsed >= 0.5) {
-            const std::string title =
-                std::format("Engine2 | {:.0f} fps | render cpu {:.2f} ms | gpu {:.2f} ms | {} chunks | {:.2f}M quads",
-                            statFrames / elapsed, cpuAccumMs / statFrames, gpuAccumMs / statFrames, stats.drawnChunks,
-                            static_cast<f64>(stats.drawnQuads) / 1e6);
+            const voxel::ChunkStreamer::Stats ss = streamer.stats();
+            const render::MeshMemoryStats ms = renderer.meshStats();
+            const std::string title = std::format(
+                "Engine2 | {:.0f} fps | render cpu {:.2f} ms | gpu {:.2f} ms | stream {:.2f} ms | {} chunks | "
+                "{:.2f}M quads | {} meshed, {} jobs, {:.1f} MB/s up, mesh mem {:.0f}/{:.0f} MiB",
+                statFrames / elapsed, cpuAccumMs / statFrames, gpuAccumMs / statFrames, streamAccumMs / statFrames,
+                stats.drawnChunks, static_cast<f64>(stats.drawnQuads) / 1e6, ss.meshedChunks, ss.jobsInFlight,
+                static_cast<f64>(uploadAccum) / elapsed / 1e6, static_cast<f64>(ms.usedBytes) / (1024.0 * 1024.0),
+                static_cast<f64>(ms.capacityBytes) / (1024.0 * 1024.0));
             window.setTitle(title.c_str());
             if (opt.frames >= 0) {
                 std::fprintf(stderr, "%s\n", title.c_str());
             }
+            if (ms.failed > 0) {
+                std::fprintf(stderr, "Warning: %u chunk meshes did not fit (raise RendererDesc limits)\n", ms.failed);
+            }
             statsStart = Clock::now();
-            cpuAccumMs = gpuAccumMs = 0.0;
+            cpuAccumMs = gpuAccumMs = streamAccumMs = 0.0;
+            uploadAccum = 0;
             statFrames = 0;
         }
     }

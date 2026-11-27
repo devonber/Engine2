@@ -28,6 +28,7 @@ endforeach()
 # ---- Renderer ------------------------------------------------------------------------
 add_library(engine_renderer STATIC
     src/BlockTextures.cpp
+    src/ChunkMeshStore.cpp
     src/Renderer.cpp
     src/Swapchain.cpp
     src/VulkanContext.cpp

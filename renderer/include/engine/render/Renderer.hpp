@@ -7,9 +7,11 @@
 #include "engine/voxel/Mesher.hpp"
 
 #include <array>
+#include <glm/glm.hpp>
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace engine::platform {
 class Window;
@@ -19,23 +21,33 @@ namespace engine::render {
 
 struct Camera;
 
-// One chunk's slice of the world quad buffer.
-struct ChunkDraw {
-    i32 originX = 0, originY = 0, originZ = 0; // world position of voxel (0,0,0), in blocks
-    u32 firstQuad = 0;
-    u32 quadCount = 0;
-};
-
 struct RendererDesc {
     PresentMode presentMode = PresentMode::Uncapped;
     f32 fogDistance = 300.0f; // blocks
+
+    // Chunk mesh storage (fixed at start-up).
+    u32 maxChunks = 16384;                    // resident chunk meshes
+    u64 quadCapacity = 8u * 1024 * 1024;      // quads in the shared buffer (8 bytes each: 64 MiB)
+    u64 uploadBudgetBytes = 4u * 1024 * 1024; // mesh data copied to the GPU per frame, at most
 };
 
 struct FrameStats {
     f64 gpuMs = 0.0; // GPU time of the most recently completed frame
     u32 drawnChunks = 0;
     u64 drawnQuads = 0;
+    u64 uploadedBytes = 0; // mesh data copied to the GPU this frame
 };
+
+struct MeshMemoryStats {
+    u32 chunks = 0;
+    u64 quads = 0;
+    u64 usedBytes = 0;
+    u64 capacityBytes = 0;
+    u64 pendingBytes = 0; // waiting for upload budget
+    u32 failed = 0;       // meshes rejected: quad buffer or chunk slots full
+};
+
+class ChunkMeshStore;
 
 class Renderer {
 public:
@@ -46,9 +58,13 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
 
-    // Replace the whole world. Quads of chunk i live at
-    // quads[chunks[i].firstQuad .. +quadCount]. Stalls the GPU; load-time only.
-    void uploadWorld(std::span<const voxel::PackedQuad> quads, std::span<const ChunkDraw> chunks);
+    // Add or replace the mesh of the chunk identified by `key`; `origin` is the
+    // world position of its voxel (0,0,0). Uploaded in the background over
+    // the next frames (see RendererDesc::uploadBudgetBytes). False if there is
+    // no room. Call between frames.
+    bool setChunkMesh(u64 key, glm::ivec3 origin, std::vector<voxel::PackedQuad>&& quads);
+    void removeChunkMesh(u64 key);
+    [[nodiscard]] MeshMemoryStats meshStats() const;
 
     // Upload block textures and the (block, face) -> texture layer table.
     // Must be called before anything is drawn. Stalls the GPU; load-time only.
@@ -73,11 +89,11 @@ private:
     void createDepth();
     void destroyDepth();
     void createIndexBuffer();
-    void destroyWorld();
     void destroyTextures();
     void recreateSwapchain();
     [[nodiscard]] u32 cullAndWriteDraws(Frame& frame, const Camera& camera, u64& drawnQuads) const;
-    void recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Camera& camera, bool screenshot);
+    [[nodiscard]] VkDeviceSize recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Camera& camera,
+                                           bool screenshot);
     void writeScreenshot();
     [[nodiscard]] f64 readGpuTime(u32 frameIndex) const;
 
@@ -98,9 +114,7 @@ private:
     VkFormat m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
 
     Buffer m_indexBuffer; // shared quad index pattern, sized for the densest possible chunk
-    Buffer m_quadBuffer;
-    Buffer m_chunkBuffer;
-    std::vector<ChunkDraw> m_chunks;
+    std::unique_ptr<ChunkMeshStore> m_meshes;
 
     VkImage m_textureImage = VK_NULL_HANDLE;
     VmaAllocation m_textureAllocation = nullptr;

@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -20,10 +22,15 @@ namespace engine {
 // finish early simply take more, which balances uneven items (e.g. empty vs
 // complex chunks) without a scheduler.
 //
-// One parallelFor runs at a time; concurrent callers queue up. Asynchronous
-// background jobs (chunk streaming) will need a task queue on top of this.
+// One parallelFor runs at a time; concurrent callers queue up.
+//
+// Background jobs (submit) run on workers whenever they are not helping with
+// a parallelFor, in FIFO order. The caller of a parallelFor always works on
+// it, so long-running jobs never block it.
 class ThreadPool {
 public:
+    using Job = std::move_only_function<void()>;
+
     // workers = 0: one per hardware thread, minus the caller's.
     explicit ThreadPool(u32 workers = 0);
     ~ThreadPool();
@@ -53,6 +60,15 @@ public:
         run(Task{invoke, const_cast<void*>(static_cast<const void*>(&fn)), count, std::max(grain, 1u)});
     }
 
+    // Queue a job to run on a worker thread. The job must not throw, and
+    // whatever it references must outlive it: jobs still queued when the pool
+    // is destroyed are dropped, so owners wait for their own jobs first.
+    // With no workers the job runs immediately on the caller.
+    void submit(Job job);
+
+    // Jobs queued but not yet started.
+    [[nodiscard]] u32 queuedJobs() const;
+
 private:
     struct Task {
         void (*invoke)(void* ctx, u32 begin, u32 end) = nullptr;
@@ -67,14 +83,15 @@ private:
 
     std::vector<std::thread> m_threads;
 
-    std::mutex m_submit; // serialises parallelFor calls
-    std::mutex m_mutex;  // guards everything below except the atomics
+    std::mutex m_submit;        // serialises parallelFor calls
+    mutable std::mutex m_mutex; // guards everything below except the atomics
     std::condition_variable m_wake;
     std::condition_variable m_idle;
     Task m_task;
     u64 m_generation = 0; // bumped for every task; workers run each generation once
     u32 m_busy = 0;       // workers still inside the current task
     bool m_stop = false;
+    std::deque<Job> m_jobs;
 
     std::atomic<u32> m_next{0}; // next index to hand out
 };

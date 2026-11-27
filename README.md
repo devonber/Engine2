@@ -72,10 +72,12 @@ Vulkan 1.3, written for throughput:
 - **Meshing** (`engine/voxel/Mesher.hpp`): visible faces are found 32 voxels at a time with bit operations,
   faces between neighbouring chunks are culled, and adjacent faces of the same block are merged into
   rectangles (greedy meshing). On the sandbox world that cuts 2.87M quads to 0.62M (4.6x).
-- **World building** (`engine/voxel/World.hpp`) generates and meshes chunks in parallel on a thread pool
-  (`engine/core/ThreadPool.hpp`); the result is identical for any thread count.
-- **Vertex pulling**: no vertex buffers. Each visible block face is one 8-byte `PackedQuad` in a storage
-  buffer, and the vertex shader expands it into a quad.
+- **Streaming** (`engine/voxel/ChunkStreamer.hpp`): chunks around the camera are generated and meshed by
+  background jobs on a thread pool (`engine/core/ThreadPool.hpp`), nearest first, and unloaded behind it.
+  Chunk memory is pooled and reused. The renderer keeps all chunk meshes in one GPU buffer, divided up by
+  a VMA virtual allocator, and uploads new meshes within a per-frame byte budget.
+- **Explicit AVX2** in the hot loops (voxel bitmasks, terrain layers, face masks), with plain C++
+  fallbacks, so speed does not depend on what a compiler's auto-vectoriser happens to do.
 - **One draw call for the whole world**: chunks are frustum-culled on the CPU, which writes one
   `vkCmdDrawIndexedIndirect` command per visible chunk.
 - **Reversed-Z, infinite far plane** with a 32-bit float depth buffer: even depth precision at any distance.
@@ -90,8 +92,11 @@ Vulkan 1.3, written for throughput:
 Sandbox controls: left-click to capture the mouse, Esc to release; WASD to move, Space/Shift for
 up/down, Ctrl for speed. Frame rate, CPU and GPU times are shown in the title bar.
 
-Sandbox options: `--radius N` (world size in chunks), `--vsync`, `--validation` / `--no-validation`,
-`--camera x,y,z,yawDeg,pitchDeg`, `--assets DIR`, `--mesher greedy|binary`, `--no-border-culling`, `--threads N`, `--frames N` (quit after N frames), `--screenshot file.bmp`.
+Sandbox options: `--radius N` (view radius in chunks), `--vsync`, `--validation` / `--no-validation`,
+`--camera x,y,z,yawDeg,pitchDeg`, `--assets DIR`, `--mesher greedy|binary`, `--threads N`,
+`--fly SPEED` (fly forward automatically, blocks/s), `--frames N` (quit N frames after the initial area
+has loaded), `--screenshot file.bmp`. The title bar shows frame, CPU, GPU and streaming times, chunks
+drawn and meshed, background jobs, upload rate and mesh memory.
 
 Validation is on by default in Debug builds. For deeper checks, set these environment variables
 (in Visual Studio: right-click `sandbox.exe` → *Add Debug Configuration* → `"env"`):

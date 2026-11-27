@@ -3,7 +3,9 @@
 #include <doctest/doctest.h>
 
 #include <atomic>
+#include <chrono>
 #include <numeric>
+#include <thread>
 #include <vector>
 
 using namespace engine;
@@ -55,4 +57,78 @@ TEST_CASE("A single-worker pool still covers the whole range")
     std::vector<u32> v(100);
     single.parallelFor(100, [&](u32 i) { v[i] = i * 2; });
     CHECK(std::accumulate(v.begin(), v.end(), 0u) == 9900u);
+}
+
+namespace {
+// Waits (with a generous timeout) for a counter to reach a value.
+bool waitFor(const std::atomic<u32>& counter, u32 value)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (counter.load() < value) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+} // namespace
+
+TEST_CASE("Submitted jobs all run, on worker threads")
+{
+    ThreadPool pool(3);
+    std::atomic<u32> done{0};
+    std::atomic<u32> onCaller{0};
+    const auto caller = std::this_thread::get_id();
+    for (u32 i = 0; i < 500; ++i) {
+        pool.submit([&] {
+            onCaller.fetch_add(std::this_thread::get_id() == caller ? 1 : 0);
+            done.fetch_add(1);
+        });
+    }
+    REQUIRE(waitFor(done, 500));
+    CHECK(onCaller.load() == 0);
+    CHECK(pool.queuedJobs() == 0);
+}
+
+TEST_CASE("parallelFor completes while background jobs are running")
+{
+    ThreadPool pool(3);
+    std::atomic<bool> release{false};
+    std::atomic<u32> started{0};
+    std::atomic<u32> finished{0};
+    // Occupy every worker with a job that waits for us.
+    for (u32 i = 0; i < 3; ++i) {
+        pool.submit([&] {
+            started.fetch_add(1);
+            while (!release.load()) {
+                std::this_thread::yield();
+            }
+            finished.fetch_add(1);
+        });
+    }
+    REQUIRE(waitFor(started, 3));
+
+    // The caller must be able to finish the whole range alone.
+    std::vector<u32> out(100, 0);
+    pool.parallelFor(100, [&](u32 i) { out[i] = i + 1; });
+    for (u32 i = 0; i < 100; ++i) {
+        REQUIRE(out[i] == i + 1);
+    }
+
+    release.store(true);
+    REQUIRE(waitFor(finished, 3));
+}
+
+TEST_CASE("Mixing jobs and parallelFor under load")
+{
+    ThreadPool pool(3);
+    std::atomic<u32> jobs{0};
+    for (u32 round = 0; round < 200; ++round) {
+        pool.submit([&] { jobs.fetch_add(1); });
+        std::atomic<u32> sum{0};
+        pool.parallelFor(64, [&](u32 i) { sum.fetch_add(i); });
+        REQUIRE(sum.load() == 64 * 63 / 2);
+    }
+    REQUIRE(waitFor(jobs, 200));
 }

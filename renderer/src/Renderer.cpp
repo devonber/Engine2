@@ -9,6 +9,8 @@
 #include <fstream>
 #include <vector>
 
+#include "ChunkMeshStore.hpp"
+
 namespace engine::render {
 
 namespace {
@@ -144,6 +146,25 @@ Renderer::Renderer(VulkanContext& ctx, platform::Window& window, const RendererD
     createPipeline();
     createIndexBuffer();
 
+    m_meshes = std::make_unique<ChunkMeshStore>(m_ctx, desc.quadCapacity, desc.maxChunks, kFramesInFlight,
+                                                desc.uploadBudgetBytes);
+    const VkDescriptorBufferInfo meshBuffers[] = {
+        {m_meshes->quadBuffer(), 0, VK_WHOLE_SIZE},
+        {m_meshes->originBuffer(), 0, VK_WHOLE_SIZE},
+    };
+    VkWriteDescriptorSet meshWrites[2];
+    for (u32 i = 0; i < 2; ++i) {
+        meshWrites[i] = VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = m_set,
+            .dstBinding = i,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &meshBuffers[i],
+        };
+    }
+    vkUpdateDescriptorSets(device, 2, meshWrites, 0, nullptr);
+
     for (Frame& f : m_frames) {
         const VkCommandPoolCreateInfo cmdPoolInfo{
             .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -166,6 +187,9 @@ Renderer::Renderer(VulkanContext& ctx, platform::Window& window, const RendererD
         VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &f.inFlight));
         const VkSemaphoreCreateInfo semInfo{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VK_CHECK(vkCreateSemaphore(device, &semInfo, nullptr, &f.imageAcquired));
+        // Worst case: every resident chunk visible.
+        f.indirect = createBuffer(m_ctx.allocator(), desc.maxChunks * sizeof(VkDrawIndexedIndirectCommand),
+                                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, MemoryKind::Upload);
     }
 
     const VkQueryPoolCreateInfo queryInfo{
@@ -188,7 +212,7 @@ Renderer::~Renderer()
         vkDestroyCommandPool(device, f.pool, nullptr);
     }
     vkDestroyQueryPool(device, m_queryPool, nullptr);
-    destroyWorld();
+    m_meshes.reset();
     destroyTextures();
     destroyBuffer(m_ctx.allocator(), m_indexBuffer);
     destroyBuffer(m_ctx.allocator(), m_screenshotBuffer);
@@ -354,57 +378,21 @@ void Renderer::createIndexBuffer()
         createBufferWithData(m_ctx, indices.data(), indices.size() * sizeof(u32), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
 }
 
-void Renderer::destroyWorld()
+bool Renderer::setChunkMesh(u64 key, glm::ivec3 origin, std::vector<voxel::PackedQuad>&& quads)
 {
-    destroyBuffer(m_ctx.allocator(), m_quadBuffer);
-    destroyBuffer(m_ctx.allocator(), m_chunkBuffer);
-    m_chunks.clear();
+    ENGINE_ASSERT(quads.size() <= kMaxQuadsPerChunk);
+    return m_meshes->set(key, origin, std::move(quads));
 }
 
-void Renderer::uploadWorld(std::span<const voxel::PackedQuad> quads, std::span<const ChunkDraw> chunks)
+void Renderer::removeChunkMesh(u64 key)
 {
-    ENGINE_PROFILE_FUNCTION();
-    vkDeviceWaitIdle(m_ctx.device());
-    destroyWorld();
-    if (quads.empty() || chunks.empty()) {
-        return;
-    }
+    m_meshes->remove(key);
+}
 
-    m_chunks.assign(chunks.begin(), chunks.end());
-    std::vector<glm::ivec4> origins;
-    origins.reserve(chunks.size());
-    for (const ChunkDraw& c : chunks) {
-        ENGINE_ASSERT(c.quadCount <= kMaxQuadsPerChunk);
-        origins.emplace_back(c.originX, c.originY, c.originZ, 0);
-    }
-
-    m_quadBuffer = createBufferWithData(m_ctx, quads.data(), quads.size_bytes(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    m_chunkBuffer = createBufferWithData(m_ctx, origins.data(), origins.size() * sizeof(glm::ivec4),
-                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    const VkDescriptorBufferInfo bufferInfos[] = {
-        {m_quadBuffer.buffer, 0, VK_WHOLE_SIZE},
-        {m_chunkBuffer.buffer, 0, VK_WHOLE_SIZE},
-    };
-    VkWriteDescriptorSet writes[2];
-    for (u32 i = 0; i < 2; ++i) {
-        writes[i] = VkWriteDescriptorSet{
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = m_set,
-            .dstBinding = i,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pBufferInfo = &bufferInfos[i],
-        };
-    }
-    vkUpdateDescriptorSets(m_ctx.device(), 2, writes, 0, nullptr);
-
-    // Per-frame indirect buffers sized for the worst case (every chunk visible).
-    for (Frame& f : m_frames) {
-        destroyBuffer(m_ctx.allocator(), f.indirect);
-        f.indirect = createBuffer(m_ctx.allocator(), chunks.size() * sizeof(VkDrawIndexedIndirectCommand),
-                                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, MemoryKind::Upload);
-    }
+MeshMemoryStats Renderer::meshStats() const
+{
+    const ChunkMeshStore::Stats s = m_meshes->stats();
+    return {s.chunks, s.quads, s.usedBytes, s.capacityBytes, s.pendingBytes, s.failed};
 }
 
 void Renderer::destroyTextures()
@@ -542,9 +530,6 @@ void Renderer::recreateSwapchain()
 u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, u64& drawnQuads) const
 {
     ENGINE_PROFILE_FUNCTION();
-    if (m_chunks.empty()) {
-        return 0;
-    }
     const VkExtent2D extent = m_swapchain->extent();
     const f32 aspect = static_cast<f32>(extent.width) / static_cast<f32>(extent.height);
     const Frustum frustum = Frustum::fromViewProj(camera.projection(aspect) * camera.view());
@@ -553,15 +538,15 @@ u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, u64& drawnQu
     auto* cmds = static_cast<VkDrawIndexedIndirectCommand*>(frame.indirect.mapped);
     u32 count = 0;
     constexpr f32 kSize = static_cast<f32>(voxel::kChunkSize);
-    for (u32 i = 0; i < m_chunks.size(); ++i) {
-        const ChunkDraw& c = m_chunks[i];
-        if (c.quadCount == 0) {
+    const std::span<const ChunkMeshStore::Slot> slots = m_meshes->slots();
+    for (u32 i = 0; i < slots.size(); ++i) {
+        const ChunkMeshStore::Slot& c = slots[i];
+        if (!c.drawable || c.quadCount == 0) {
             continue;
         }
-        const glm::vec3 min{static_cast<f32>(c.originX), static_cast<f32>(c.originY), static_cast<f32>(c.originZ)};
+        const glm::vec3 min{c.origin};
         const glm::vec3 max = min + kSize;
-        const glm::vec3 centre = (min + max) * 0.5f;
-        const glm::vec3 d = centre - camera.position;
+        const glm::vec3 d = (min + max) * 0.5f - camera.position;
         if (glm::dot(d, d) > maxDistSq || !frustum.intersects(min, max)) {
             continue;
         }
@@ -570,11 +555,14 @@ u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, u64& drawnQu
             .instanceCount = 1,
             .firstIndex = 0,
             .vertexOffset = static_cast<i32>(c.firstQuad * 4),
-            .firstInstance = i,
+            .firstInstance = i, // slot index: selects the chunk origin in the shader
         };
         drawnQuads += c.quadCount;
     }
-    VK_CHECK(vmaFlushAllocation(m_ctx.allocator(), frame.indirect.allocation, 0, VK_WHOLE_SIZE));
+    if (count > 0) {
+        VK_CHECK(vmaFlushAllocation(m_ctx.allocator(), frame.indirect.allocation, 0,
+                                    count * sizeof(VkDrawIndexedIndirectCommand)));
+    }
     return count;
 }
 
@@ -604,6 +592,7 @@ FrameStats Renderer::renderFrame(const Camera& camera)
     if (frame.timestampsWritten) {
         stats.gpuMs = readGpuTime(m_frameIndex);
     }
+    m_meshes->beginFrame(m_frameIndex); // the GPU is done with what this frame slot last used
 
     if (m_window.consumeResized()) {
         recreateSwapchain();
@@ -627,7 +616,7 @@ FrameStats Renderer::renderFrame(const Camera& camera)
     stats.drawnQuads = drawnQuads;
 
     const bool screenshot = !m_screenshotPath.empty();
-    recordFrame(frame, imageIndex, drawCount, camera, screenshot);
+    stats.uploadedBytes = recordFrame(frame, imageIndex, drawCount, camera, screenshot);
 
     const VkSemaphoreSubmitInfo waitInfo{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
@@ -678,10 +667,11 @@ FrameStats Renderer::renderFrame(const Camera& camera)
     }
 
     m_frameIndex = (m_frameIndex + 1) % kFramesInFlight;
+    m_meshes->endFrame(m_frameIndex);
     return stats;
 }
 
-void Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Camera& camera, bool screenshot)
+VkDeviceSize Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Camera& camera, bool screenshot)
 {
     ENGINE_PROFILE_FUNCTION();
     VkCommandBuffer cmd = frame.cmd;
@@ -695,6 +685,9 @@ void Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Ca
     const u32 query = m_frameIndex * 2;
     vkCmdResetQueryPool(cmd, m_queryPool, query, 2);
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, query);
+
+    // New chunk meshes, copied in before anything draws (outside the render pass).
+    const VkDeviceSize uploaded = m_meshes->recordUploads(cmd, m_frameIndex);
 
     VkImage colorImage = m_swapchain->image(imageIndex);
     const VkExtent2D extent = m_swapchain->extent();
@@ -799,6 +792,7 @@ void Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Ca
 
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, m_queryPool, query + 1);
     VK_CHECK(vkEndCommandBuffer(cmd));
+    return uploaded;
 }
 
 void Renderer::writeScreenshot()
