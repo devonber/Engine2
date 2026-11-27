@@ -21,6 +21,19 @@ option(ENGINE_ENABLE_LTO           "Link-time optimisation in optimised configs"
 option(ENGINE_ENABLE_SANITIZERS    "AddressSanitizer (+UBSan on GCC/Clang)"         OFF)
 option(ENGINE_WARNINGS_AS_ERRORS   "Treat warnings as errors in engine targets"     OFF)
 
+# Single-config generators (Ninja, Makefiles) build with *no* optimisation
+# flags when CMAKE_BUILD_TYPE is empty. That can happen silently, e.g. when
+# CMake wipes its cache after a compiler change. Never let it go unnoticed.
+get_property(_engine_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT _engine_multi_config)
+    if(NOT CMAKE_BUILD_TYPE)
+        message(WARNING "CMAKE_BUILD_TYPE is empty: defaulting to Release. "
+                        "Use a preset (cmake --preset <name>) or delete the build folder and reconfigure.")
+        set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    endif()
+    message(STATUS "Engine2 build type: ${CMAKE_BUILD_TYPE}")
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
