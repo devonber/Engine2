@@ -1,9 +1,15 @@
 #include "engine/voxel/Mesher.hpp"
 
+#include "engine/core/Bits.hpp"
 #include "engine/core/Profile.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
+
+#if defined(__AVX2__)
+    #include <immintrin.h>
+#endif
 
 namespace engine::voxel {
 
@@ -45,28 +51,56 @@ constexpr std::array<std::array<u8, 2>, 3> kColumnAxes{{
     {1, 0}, // z columns: a = y, b = x
 }};
 
+// Solid bits of 32 consecutive voxels along x (bit i = row[i] is not air).
+[[nodiscard]] ENGINE_FORCEINLINE u32 solidMask32(const BlockId* row) noexcept
+{
+#if defined(__AVX2__)
+    // Explicit AVX2 rather than trusting auto-vectorisation (MSVC does not
+    // vectorise the scalar loop below). 16 voxels per compare.
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i airLo = _mm256_cmpeq_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(row)), zero);
+    const __m256i airHi = _mm256_cmpeq_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + 16)), zero);
+    // Narrow 16-bit lanes to bytes. packs works per 128-bit half, giving
+    // qwords [lo 0-7, hi 0-7, lo 8-15, hi 8-15]; reorder to 0,2,1,3.
+    const __m256i packed = _mm256_permute4x64_epi64(_mm256_packs_epi16(airLo, airHi), 0xD8);
+    return ~static_cast<u32>(_mm256_movemask_epi8(packed));
+#else
+    u32 bits = 0;
+    for (u32 x = 0; x < kChunkSize; ++x) {
+        bits |= (row[x] != kAir ? 1u : 0u) << x;
+    }
+    return bits;
+#endif
+}
+
 void buildColumns(const Chunk& chunk, Columns& cols) noexcept
 {
     ENGINE_PROFILE_SCOPE("buildColumns");
-    cols.y.fill(0);
-    cols.z.fill(0);
-    const BlockId* ENGINE_RESTRICT blocks = chunk.blocks().data();
+    const BlockId* blocks = chunk.blocks().data();
 
+    // x columns straight from memory: each 32-voxel row along x is one mask.
     for (u32 y = 0; y < kChunkSize; ++y) {
         for (u32 z = 0; z < kChunkSize; ++z) {
-            const BlockId* row = blocks + voxelIndex(0, y, z);
-            u32 xBits = 0;
-            // Branchless: for each voxel, OR its solid bit into all three columns.
-            // The inner loop has no data-dependent branches and contiguous
-            // loads/stores, which lets the compiler vectorise it.
-            for (u32 x = 0; x < kChunkSize; ++x) {
-                const u32 solid = row[x] != kAir ? 1u : 0u;
-                xBits |= solid << x;
-                cols.y[z * kChunkSize + x] |= solid << y;
-                cols.z[y * kChunkSize + x] |= solid << z;
-            }
-            cols.x[y * kChunkSize + z] = xBits;
+            cols.x[y * kChunkSize + z] = solidMask32(blocks + voxelIndex(0, y, z));
         }
+    }
+
+    // The other two axes are bit-matrix transposes of the x columns, instead
+    // of scattering every voxel's bit into three arrays.
+    std::array<u32, 32> m;
+    for (u32 y = 0; y < kChunkSize; ++y) {
+        // Layer y: rows z, bits x  ->  rows x, bits z = z columns.
+        std::copy_n(&cols.x[y * kChunkSize], kChunkSize, m.begin());
+        transpose32(m);
+        std::copy_n(m.begin(), kChunkSize, &cols.z[y * kChunkSize]);
+    }
+    for (u32 z = 0; z < kChunkSize; ++z) {
+        // Slice z: rows y, bits x  ->  rows x, bits y = y columns.
+        for (u32 y = 0; y < kChunkSize; ++y) {
+            m[y] = cols.x[y * kChunkSize + z];
+        }
+        transpose32(m);
+        std::copy_n(m.begin(), kChunkSize, &cols.y[z * kChunkSize]);
     }
 }
 
@@ -75,45 +109,84 @@ void buildColumns(const Chunk& chunk, Columns& cols) noexcept
     return axis == 0 ? cols.x : axis == 1 ? cols.y : cols.z;
 }
 
-// Visible faces of one column: solid voxels whose neighbour along the face
-// normal is air. Inside the chunk the neighbour is the column shifted by one;
-// at the border it is the bit from the neighbouring chunk's boundary mask.
+// Visible-face masks of every column for one face direction, laid out like
+// the columns ([a * 32 + b], bit = position along the normal).
+using FaceMasks = std::array<u32, kChunkArea>;
+
+// Fills `out` for face F and returns the OR of all masks: bit i set means
+// slice i (along the normal) has at least one visible face. Zero = no faces.
 template <Face F>
-[[nodiscard]] ENGINE_FORCEINLINE u32 visibleFaces(const Columns& cols, const BoundaryMasks& nb, u32 a, u32 b) noexcept
+u32 computeFaceMasks(const Columns& cols, const BoundaryMasks& nb, FaceMasks& out) noexcept
 {
     constexpr u32 axis = kFaceAxes[static_cast<usize>(F)].normal;
     constexpr bool positive = (static_cast<u32>(F) & 1u) == 0;
-    const u32 col = columnsFor(cols, axis)[a * kChunkSize + b];
-    const u32 outside = (nb.rows[static_cast<usize>(F)][a] >> b) & 1u;
-    if constexpr (positive) {
-        return col & ~((col >> 1) | (outside << 31));
-    } else {
-        return col & ~((col << 1) | outside);
+    const auto& columns = columnsFor(cols, axis);
+    const auto& outsideRows = nb.rows[static_cast<usize>(F)];
+
+#if defined(__AVX2__)
+    // 8 columns per step. The neighbour bit of column b is bit b of the
+    // boundary row, extracted with a per-lane variable shift.
+    __m256i any = _mm256_setzero_si256();
+    const __m256i one = _mm256_set1_epi32(1);
+    for (u32 a = 0; a < kChunkSize; ++a) {
+        const __m256i row = _mm256_set1_epi32(static_cast<i32>(outsideRows[a]));
+        for (u32 b = 0; b < kChunkSize; b += 8) {
+            const u32 idx = a * kChunkSize + b;
+            const __m256i col = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&columns[idx]));
+            const __m256i lane = _mm256_setr_epi32(
+                static_cast<i32>(b), static_cast<i32>(b + 1), static_cast<i32>(b + 2), static_cast<i32>(b + 3),
+                static_cast<i32>(b + 4), static_cast<i32>(b + 5), static_cast<i32>(b + 6), static_cast<i32>(b + 7));
+            const __m256i outside = _mm256_and_si256(_mm256_srlv_epi32(row, lane), one);
+            __m256i blocked;
+            if constexpr (positive) {
+                blocked = _mm256_or_si256(_mm256_srli_epi32(col, 1), _mm256_slli_epi32(outside, 31));
+            } else {
+                blocked = _mm256_or_si256(_mm256_slli_epi32(col, 1), outside);
+            }
+            const __m256i visible = _mm256_andnot_si256(blocked, col);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(&out[idx]), visible);
+            any = _mm256_or_si256(any, visible);
+        }
     }
+    // Horizontal OR of the 8 lanes.
+    __m128i x = _mm_or_si128(_mm256_castsi256_si128(any), _mm256_extracti128_si256(any, 1));
+    x = _mm_or_si128(x, _mm_shuffle_epi32(x, 0x4E));
+    x = _mm_or_si128(x, _mm_shuffle_epi32(x, 0xB1));
+    return static_cast<u32>(_mm_cvtsi128_si32(x));
+#else
+    u32 any = 0;
+    for (u32 a = 0; a < kChunkSize; ++a) {
+        const u32 row = outsideRows[a];
+        for (u32 b = 0; b < kChunkSize; ++b) {
+            const u32 col = columns[a * kChunkSize + b];
+            const u32 outside = (row >> b) & 1u;
+            const u32 visible = positive ? col & ~((col >> 1) | (outside << 31)) : col & ~((col << 1) | outside);
+            out[a * kChunkSize + b] = visible;
+            any |= visible;
+        }
+    }
+    return any;
+#endif
 }
 
-template <Face F>
-[[nodiscard]] u32 countFaces(const Columns& cols, const BoundaryMasks& nb) noexcept
+[[nodiscard]] u32 countFaces(const FaceMasks& masks) noexcept
 {
     u32 count = 0;
-    for (u32 a = 0; a < kChunkSize; ++a) {
-        for (u32 b = 0; b < kChunkSize; ++b) {
-            count += static_cast<u32>(std::popcount(visibleFaces<F>(cols, nb, a, b)));
-        }
+    for (const u32 m : masks) {
+        count += static_cast<u32>(std::popcount(m));
     }
     return count;
 }
 
 template <Face F>
-void emitUnitQuads(const Columns& cols, const BoundaryMasks& nb, const BlockId* ENGINE_RESTRICT blocks,
-                   PackedQuad*& dst) noexcept
+void emitUnitQuads(const FaceMasks& masks, const BlockId* ENGINE_RESTRICT blocks, PackedQuad*& dst) noexcept
 {
     constexpr u32 axis = kFaceAxes[static_cast<usize>(F)].normal;
     constexpr u32 axisA = kColumnAxes[axis][0];
     constexpr u32 axisB = kColumnAxes[axis][1];
     for (u32 a = 0; a < kChunkSize; ++a) {
         for (u32 b = 0; b < kChunkSize; ++b) {
-            u32 mask = visibleFaces<F>(cols, nb, a, b);
+            u32 mask = masks[a * kChunkSize + b];
             while (mask != 0) {
                 const u32 i = static_cast<u32>(std::countr_zero(mask));
                 mask &= mask - 1; // clear lowest set bit
@@ -136,7 +209,7 @@ void emitUnitQuads(const Columns& cols, const BoundaryMasks& nb, const BlockId* 
 //    the whole run set with the same block. Clear it and emit one quad.
 template <Face F>
 void emitGreedyQuads(const Columns& cols, const BoundaryMasks& nb, const BlockId* ENGINE_RESTRICT blocks,
-                     std::vector<PackedQuad>& out)
+                     FaceMasks& masks, std::vector<PackedQuad>& out)
 {
     constexpr FaceAxes axes = kFaceAxes[static_cast<usize>(F)];
     constexpr u32 axisA = kColumnAxes[axes.normal][0];
@@ -145,30 +218,41 @@ void emitGreedyQuads(const Columns& cols, const BoundaryMasks& nb, const BlockId
     constexpr u32 strideU = kAxisStride[axes.u];
     constexpr u32 strideV = kAxisStride[axes.v];
 
-    std::array<std::array<u32, kChunkSize>, kChunkSize> planes{}; // [slice][v], 4 KiB
+    const u32 slicesWithFaces = computeFaceMasks<F>(cols, nb, masks);
+    if (slicesWithFaces == 0) {
+        return; // e.g. the bottom of a chunk resting on solid ground
+    }
 
+    std::array<std::array<u32, kChunkSize>, kChunkSize> planes; // [slice][v], 4 KiB
     {
         ENGINE_PROFILE_SCOPE("scatterPlanes");
+        for (u32 bits = slicesWithFaces; bits != 0; bits &= bits - 1) {
+            planes[static_cast<usize>(std::countr_zero(bits))].fill(0); // only slices we will use
+        }
         for (u32 a = 0; a < kChunkSize; ++a) {
             for (u32 b = 0; b < kChunkSize; ++b) {
-                u32 mask = visibleFaces<F>(cols, nb, a, b);
+                u32 mask = masks[a * kChunkSize + b];
+                if (mask == 0) {
+                    continue;
+                }
                 // (a, b) are the column's in-plane coordinates; map them to (u, v).
                 std::array<u32, 3> c{};
                 c[axisA] = a;
                 c[axisB] = b;
                 const u32 uBit = 1u << c[axes.u];
                 const u32 v = c[axes.v];
-                while (mask != 0) {
+                do {
                     const u32 slice = static_cast<u32>(std::countr_zero(mask));
                     mask &= mask - 1;
                     planes[slice][v] |= uBit;
-                }
+                } while (mask != 0);
             }
         }
     }
 
     ENGINE_PROFILE_SCOPE("mergeQuads");
-    for (u32 slice = 0; slice < kChunkSize; ++slice) {
+    for (u32 bits = slicesWithFaces; bits != 0; bits &= bits - 1) {
+        const u32 slice = static_cast<u32>(std::countr_zero(bits));
         auto& rows = planes[slice];
         for (u32 v = 0; v < kChunkSize; ++v) {
             while (rows[v] != 0) {
@@ -287,23 +371,31 @@ void meshChunkBinary(const Chunk& chunk, const BoundaryMasks& neighbours, std::v
     Columns cols; // 12 KiB, intentionally uninitialised (buildColumns writes it)
     buildColumns(chunk, cols);
 
-    // Pass 1: count faces so the output is sized exactly once. Popcount is a
-    // single instruction, so this costs far less than per-face push_back checks.
-    const u32 count = countFaces<Face::PosX>(cols, neighbours) + countFaces<Face::NegX>(cols, neighbours) +
-                      countFaces<Face::PosY>(cols, neighbours) + countFaces<Face::NegY>(cols, neighbours) +
-                      countFaces<Face::PosZ>(cols, neighbours) + countFaces<Face::NegZ>(cols, neighbours);
+    // Visible faces per direction, computed once (24 KiB).
+    std::array<FaceMasks, kFaceCount> masks;
+    computeFaceMasks<Face::PosX>(cols, neighbours, masks[0]);
+    computeFaceMasks<Face::NegX>(cols, neighbours, masks[1]);
+    computeFaceMasks<Face::PosY>(cols, neighbours, masks[2]);
+    computeFaceMasks<Face::NegY>(cols, neighbours, masks[3]);
+    computeFaceMasks<Face::PosZ>(cols, neighbours, masks[4]);
+    computeFaceMasks<Face::NegZ>(cols, neighbours, masks[5]);
+
+    // Count first so the output is sized exactly once (no per-quad capacity checks).
+    u32 count = 0;
+    for (const FaceMasks& m : masks) {
+        count += countFaces(m);
+    }
     out.resize(count);
 
-    // Pass 2: walk set bits and write quads straight into the buffer.
     ENGINE_PROFILE_SCOPE("emitQuads");
     const BlockId* blocks = chunk.blocks().data();
     PackedQuad* dst = out.data();
-    emitUnitQuads<Face::PosX>(cols, neighbours, blocks, dst);
-    emitUnitQuads<Face::NegX>(cols, neighbours, blocks, dst);
-    emitUnitQuads<Face::PosY>(cols, neighbours, blocks, dst);
-    emitUnitQuads<Face::NegY>(cols, neighbours, blocks, dst);
-    emitUnitQuads<Face::PosZ>(cols, neighbours, blocks, dst);
-    emitUnitQuads<Face::NegZ>(cols, neighbours, blocks, dst);
+    emitUnitQuads<Face::PosX>(masks[0], blocks, dst);
+    emitUnitQuads<Face::NegX>(masks[1], blocks, dst);
+    emitUnitQuads<Face::PosY>(masks[2], blocks, dst);
+    emitUnitQuads<Face::NegY>(masks[3], blocks, dst);
+    emitUnitQuads<Face::PosZ>(masks[4], blocks, dst);
+    emitUnitQuads<Face::NegZ>(masks[5], blocks, dst);
     ENGINE_ASSERT(dst == out.data() + out.size());
 }
 
@@ -316,12 +408,13 @@ void meshChunkGreedy(const Chunk& chunk, const BoundaryMasks& neighbours, std::v
     buildColumns(chunk, cols);
 
     const BlockId* blocks = chunk.blocks().data();
-    emitGreedyQuads<Face::PosX>(cols, neighbours, blocks, out);
-    emitGreedyQuads<Face::NegX>(cols, neighbours, blocks, out);
-    emitGreedyQuads<Face::PosY>(cols, neighbours, blocks, out);
-    emitGreedyQuads<Face::NegY>(cols, neighbours, blocks, out);
-    emitGreedyQuads<Face::PosZ>(cols, neighbours, blocks, out);
-    emitGreedyQuads<Face::NegZ>(cols, neighbours, blocks, out);
+    FaceMasks masks; // reused for each direction
+    emitGreedyQuads<Face::PosX>(cols, neighbours, blocks, masks, out);
+    emitGreedyQuads<Face::NegX>(cols, neighbours, blocks, masks, out);
+    emitGreedyQuads<Face::PosY>(cols, neighbours, blocks, masks, out);
+    emitGreedyQuads<Face::NegY>(cols, neighbours, blocks, masks, out);
+    emitGreedyQuads<Face::PosZ>(cols, neighbours, blocks, masks, out);
+    emitGreedyQuads<Face::NegZ>(cols, neighbours, blocks, masks, out);
 }
 
 } // namespace engine::voxel
