@@ -2,10 +2,20 @@
 #define ANKERL_NANOBENCH_IMPLEMENT
 #include <nanobench.h>
 
-void runMesherBenchmarks();
+#include <cstring>
 
-int main()
+void runMesherBenchmarks();
+void runWorldBenchmarks();
+
+// Usage: engine_bench [mesh|world]   (default: all)
+int main(int argc, char** argv)
 {
-    runMesherBenchmarks();
+    const char* only = argc > 1 ? argv[1] : "";
+    if (*only == 0 || std::strcmp(only, "mesh") == 0) {
+        runMesherBenchmarks();
+    }
+    if (*only == 0 || std::strcmp(only, "world") == 0) {
+        runWorldBenchmarks();
+    }
     return 0;
 }

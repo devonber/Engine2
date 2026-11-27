@@ -13,15 +13,16 @@
 //           --assets DIR      asset folder (default: <repo>/assets)
 //           --mesher M        greedy (default) or binary (one quad per block face)
 //           --no-border-culling   draw faces between chunks (for comparison)
+//           --threads N       threads for world building (default: all; 1 = main thread only)
 
 #include "engine/core/Profile.hpp"
+#include "engine/core/ThreadPool.hpp"
 #include "engine/platform/Window.hpp"
 #include "engine/render/BlockTextures.hpp"
 #include "engine/render/Camera.hpp"
 #include "engine/render/Renderer.hpp"
 #include "engine/voxel/Blocks.hpp"
-#include "engine/voxel/Generate.hpp"
-#include "engine/voxel/Mesher.hpp"
+#include "engine/voxel/World.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -47,6 +48,7 @@ struct Options {
     std::string assets = ENGINE_ASSET_DIR;
     bool greedy = true;
     bool borderCulling = true;
+    u32 threads = 0; // 0 = all hardware threads
     f32 camera[5] = {0.0f, 45.0f, 40.0f, 0.0f, -20.0f};
 };
 
@@ -70,6 +72,8 @@ Options parseArgs(int argc, char** argv)
             o.screenshot = next();
         } else if (arg("--mesher")) {
             o.greedy = std::strcmp(next(), "binary") != 0;
+        } else if (arg("--threads")) {
+            o.threads = static_cast<u32>(std::clamp(std::atoi(next()), 0, 256));
         } else if (arg("--no-border-culling")) {
             o.borderCulling = false;
         } else if (arg("--assets")) {
@@ -81,66 +85,6 @@ Options parseArgs(int argc, char** argv)
         }
     }
     return o;
-}
-
-struct World {
-    std::vector<voxel::PackedQuad> quads;
-    std::vector<render::ChunkDraw> chunks;
-};
-
-World buildWorld(const Options& opt)
-{
-    ENGINE_PROFILE_FUNCTION();
-    const i32 radius = opt.radius;
-    const i32 side = 2 * radius;
-    constexpr i32 n = static_cast<i32>(voxel::kChunkSize);
-
-    // Generate everything first so each chunk can be meshed against its neighbours.
-    std::vector<std::unique_ptr<voxel::Chunk>> chunks(static_cast<usize>(side * side));
-    const auto at = [&](i32 cx, i32 cz) -> voxel::Chunk* {
-        if (cx < -radius || cx >= radius || cz < -radius || cz >= radius) {
-            return nullptr; // outside the world: air
-        }
-        return chunks[static_cast<usize>((cz + radius) * side + (cx + radius))].get();
-    };
-    for (i32 cz = -radius; cz < radius; ++cz) {
-        for (i32 cx = -radius; cx < radius; ++cx) {
-            auto& c = chunks[static_cast<usize>((cz + radius) * side + (cx + radius))];
-            c = std::make_unique<voxel::Chunk>();
-            voxel::fillTerrain(*c, cx, cz);
-        }
-    }
-
-    World world;
-    std::vector<voxel::PackedQuad> chunkQuads;
-    for (i32 cz = -radius; cz < radius; ++cz) {
-        for (i32 cx = -radius; cx < radius; ++cx) {
-            voxel::BoundaryMasks masks;
-            if (opt.borderCulling) {
-                voxel::ChunkNeighbours nb;
-                nb.chunks[static_cast<usize>(voxel::Face::PosX)] = at(cx + 1, cz);
-                nb.chunks[static_cast<usize>(voxel::Face::NegX)] = at(cx - 1, cz);
-                nb.chunks[static_cast<usize>(voxel::Face::PosZ)] = at(cx, cz + 1);
-                nb.chunks[static_cast<usize>(voxel::Face::NegZ)] = at(cx, cz - 1);
-                masks = voxel::buildBoundaryMasks(nb);
-                masks.setSolid(voxel::Face::NegY); // nothing is ever seen below the world
-            }
-            if (opt.greedy) {
-                voxel::meshChunkGreedy(*at(cx, cz), masks, chunkQuads);
-            } else {
-                voxel::meshChunkBinary(*at(cx, cz), masks, chunkQuads);
-            }
-            world.chunks.push_back({
-                .originX = cx * n,
-                .originY = 0,
-                .originZ = cz * n,
-                .firstQuad = static_cast<u32>(world.quads.size()),
-                .quadCount = static_cast<u32>(chunkQuads.size()),
-            });
-            world.quads.insert(world.quads.end(), chunkQuads.begin(), chunkQuads.end());
-        }
-    }
-    return world;
 }
 
 void updateCamera(render::Camera& cam, const platform::InputState& in, f32 dt)
@@ -177,6 +121,8 @@ void updateCamera(render::Camera& cam, const platform::InputState& in, f32 dt)
 int main(int argc, char** argv)
 {
     const Options opt = parseArgs(argc, argv);
+    std::fprintf(stderr, "Engine2 sandbox, %s build%s\n", ENGINE_BUILD_CONFIG,
+                 std::strcmp(ENGINE_BUILD_CONFIG, "Debug") == 0 ? " (timings are not representative)" : "");
 
     platform::Window window("Engine2", 1600, 900);
     render::VulkanContext ctx(window, {.appName = "Engine2 Sandbox", .validation = opt.validation});
@@ -198,17 +144,30 @@ int main(int argc, char** argv)
     }
     {
         const auto t0 = Clock::now();
-        const World world = buildWorld(opt);
+        // 1 thread = everything on the main thread (no pool) for comparison.
+        std::unique_ptr<ThreadPool> pool;
+        if (opt.threads != 1) {
+            pool = std::make_unique<ThreadPool>(opt.threads == 0 ? 0u : opt.threads - 1);
+        }
+        const voxel::WorldMesh world = voxel::buildTerrainWorld(
+            {.radius = opt.radius, .greedy = opt.greedy, .borderCulling = opt.borderCulling}, pool.get());
+
+        std::vector<render::ChunkDraw> draws;
+        draws.reserve(world.chunks.size());
+        constexpr i32 n = static_cast<i32>(voxel::kChunkSize);
+        for (const voxel::ChunkMeshRange& c : world.chunks) {
+            draws.push_back({c.chunkX * n, 0, c.chunkZ * n, c.firstQuad, c.quadCount});
+        }
         const auto t1 = Clock::now();
-        renderer.uploadWorld(world.quads, world.chunks);
+        renderer.uploadWorld(world.quads, draws);
         const auto t2 = Clock::now();
         std::fprintf(stderr,
-                     "World (%s mesher, border culling %s): %zu chunks, %zu quads (%.1f MiB). "
-                     "Generate+mesh %.1f ms, upload %.1f ms\n",
-                     opt.greedy ? "greedy" : "binary", opt.borderCulling ? "on" : "off", world.chunks.size(),
-                     world.quads.size(),
+                     "World (%s mesher, border culling %s, %u threads): %zu chunks, %zu quads (%.1f MiB)\n"
+                     "  generate %.1f ms, mesh %.1f ms, total build %.1f ms, upload %.1f ms\n",
+                     opt.greedy ? "greedy" : "binary", opt.borderCulling ? "on" : "off",
+                     pool ? pool->concurrency() : 1u, world.chunks.size(), world.quads.size(),
                      static_cast<f64>(world.quads.size() * sizeof(voxel::PackedQuad)) / (1024.0 * 1024.0),
-                     std::chrono::duration<f64, std::milli>(t1 - t0).count(),
+                     world.generateMs, world.meshMs, std::chrono::duration<f64, std::milli>(t1 - t0).count(),
                      std::chrono::duration<f64, std::milli>(t2 - t1).count());
     }
 

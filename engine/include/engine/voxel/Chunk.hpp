@@ -5,6 +5,7 @@
 
 #include <array>
 #include <span>
+#include <type_traits>
 
 namespace engine::voxel {
 
@@ -36,6 +37,13 @@ inline constexpr u32 kChunkVolume = kChunkArea * kChunkSize;
 // Palette compression for memory comes later; keep the hot path simple first.
 class Chunk {
 public:
+    // Tag for skipping the zero fill when every voxel is about to be written
+    // anyway (e.g. by a generator): saves a 64 KiB memset per chunk.
+    struct Uninitialized {};
+
+    Chunk() noexcept { m_blocks.fill(kAir); }
+    explicit Chunk(Uninitialized) noexcept {}
+
     [[nodiscard]] BlockId get(u32 x, u32 y, u32 z) const noexcept
     {
         ENGINE_ASSERT(x < kChunkSize && y < kChunkSize && z < kChunkSize);
@@ -54,9 +62,10 @@ public:
     [[nodiscard]] std::span<BlockId, kChunkVolume> blocks() noexcept { return m_blocks; }
 
 private:
-    std::array<BlockId, kChunkVolume> m_blocks{};
+    std::array<BlockId, kChunkVolume> m_blocks; // not value-initialised: see the constructors
 };
 
 static_assert(sizeof(Chunk) == kChunkVolume * sizeof(BlockId));
+static_assert(std::is_trivially_destructible_v<Chunk>);
 
 } // namespace engine::voxel
