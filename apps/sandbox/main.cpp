@@ -10,11 +10,14 @@
 //           --frames N        quit after N frames (for automated runs)
 //           --screenshot F    save frame N-1 (needs --frames) or frame 60 to F (.bmp)
 //           --camera x,y,z,yaw,pitch   start position (yaw/pitch in degrees)
+//           --assets DIR      asset folder (default: <repo>/assets)
 
 #include "engine/core/Profile.hpp"
 #include "engine/platform/Window.hpp"
+#include "engine/render/BlockTextures.hpp"
 #include "engine/render/Camera.hpp"
 #include "engine/render/Renderer.hpp"
+#include "engine/voxel/Blocks.hpp"
 #include "engine/voxel/Generate.hpp"
 #include "engine/voxel/Mesher.hpp"
 
@@ -23,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <memory>
 #include <string>
@@ -38,6 +42,7 @@ struct Options {
     bool validation = ENGINE_ENABLE_ASSERTS != 0; // on in Debug builds
     i64 frames = -1;
     std::string screenshot;
+    std::string assets = ENGINE_ASSET_DIR;
     f32 camera[5] = {0.0f, 45.0f, 40.0f, 0.0f, -20.0f};
 };
 
@@ -59,6 +64,8 @@ Options parseArgs(int argc, char** argv)
             o.frames = std::atoll(next());
         } else if (arg("--screenshot")) {
             o.screenshot = next();
+        } else if (arg("--assets")) {
+            o.assets = next();
         } else if (arg("--camera")) {
             std::sscanf(next(), "%f,%f,%f,%f,%f", &o.camera[0], &o.camera[1], &o.camera[2], &o.camera[3], &o.camera[4]);
         } else {
@@ -142,6 +149,15 @@ int main(int argc, char** argv)
                               });
 
     using Clock = std::chrono::steady_clock;
+    {
+        const auto t0 = Clock::now();
+        const render::BlockTextureSet textures =
+            render::loadBlockTextures(voxel::blockRegistry(), std::filesystem::path(opt.assets) / "textures");
+        renderer.setBlockTextures(textures);
+        std::fprintf(stderr, "Textures: %u layers, %ux%u, %u mips, %.1f ms\n", textures.textures.layers,
+                     textures.textures.size, textures.textures.size, textures.textures.mipLevels,
+                     std::chrono::duration<f64, std::milli>(Clock::now() - t0).count());
+    }
     {
         const auto t0 = Clock::now();
         const World world = buildWorld(opt.radius);

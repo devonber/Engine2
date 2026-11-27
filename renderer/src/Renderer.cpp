@@ -4,6 +4,7 @@
 #include "engine/platform/Window.hpp"
 #include "engine/render/Camera.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -52,6 +53,7 @@ VkImageMemoryBarrier2 imageBarrier(VkImage image, VkImageAspectFlags aspect, VkP
                                    VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
                                    VkImageLayout oldLayout, VkImageLayout newLayout)
 {
+    // Single mip, single layer: render targets and swapchain images.
     return VkImageMemoryBarrier2{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask = srcStage,
@@ -65,6 +67,13 @@ VkImageMemoryBarrier2 imageBarrier(VkImage image, VkImageAspectFlags aspect, VkP
         .image = image,
         .subresourceRange = {aspect, 0, 1, 0, 1},
     };
+}
+
+VkImageMemoryBarrier2 wholeImageBarrier(VkImageMemoryBarrier2 b)
+{
+    b.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+    b.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+    return b;
 }
 
 void pipelineBarriers(VkCommandBuffer cmd, std::span<const VkImageMemoryBarrier2> barriers)
@@ -87,24 +96,31 @@ Renderer::Renderer(VulkanContext& ctx, platform::Window& window, const RendererD
     m_swapchain = std::make_unique<Swapchain>(m_ctx, VkExtent2D{e.width, e.height}, desc.presentMode);
     createDepth();
 
-    // Descriptor set: quad buffer + chunk origins, both read by the vertex shader.
+    // One descriptor set for the whole world:
+    //   0: quads, 1: chunk origins, 3: (block, face) -> texture layer  (vertex shader)
+    //   2: block texture array                                        (fragment shader)
     const VkDescriptorSetLayoutBinding bindings[] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
     };
     const VkDescriptorSetLayoutCreateInfo layoutInfo{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 2,
+        .bindingCount = 4,
         .pBindings = bindings,
     };
     VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_setLayout));
 
-    const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+    const VkDescriptorPoolSize poolSizes[] = {
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+    };
     const VkDescriptorPoolCreateInfo poolInfo{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 1,
-        .poolSizeCount = 1,
-        .pPoolSizes = &poolSize,
+        .poolSizeCount = 2,
+        .pPoolSizes = poolSizes,
     };
     VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_descriptorPool));
     const VkDescriptorSetAllocateInfo setInfo{
@@ -173,6 +189,7 @@ Renderer::~Renderer()
     }
     vkDestroyQueryPool(device, m_queryPool, nullptr);
     destroyWorld();
+    destroyTextures();
     destroyBuffer(m_ctx.allocator(), m_indexBuffer);
     destroyBuffer(m_ctx.allocator(), m_screenshotBuffer);
     vkDestroyPipeline(device, m_pipeline, nullptr);
@@ -390,6 +407,125 @@ void Renderer::uploadWorld(std::span<const voxel::PackedQuad> quads, std::span<c
     }
 }
 
+void Renderer::destroyTextures()
+{
+    VkDevice device = m_ctx.device();
+    vkDestroySampler(device, m_sampler, nullptr);
+    vkDestroyImageView(device, m_textureView, nullptr);
+    if (m_textureImage != VK_NULL_HANDLE) {
+        vmaDestroyImage(m_ctx.allocator(), m_textureImage, m_textureAllocation);
+    }
+    destroyBuffer(m_ctx.allocator(), m_faceLayerBuffer);
+    m_sampler = VK_NULL_HANDLE;
+    m_textureView = VK_NULL_HANDLE;
+    m_textureImage = VK_NULL_HANDLE;
+    m_textureAllocation = nullptr;
+}
+
+void Renderer::setBlockTextures(const BlockTextureSet& set)
+{
+    ENGINE_PROFILE_FUNCTION();
+    VkDevice device = m_ctx.device();
+    vkDeviceWaitIdle(device);
+    destroyTextures();
+
+    const TextureArrayData& tex = set.textures;
+    const VkImageCreateInfo imageInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_SRGB, // decoded to linear by the sampler
+        .extent = {tex.size, tex.size, 1},
+        .mipLevels = tex.mipLevels,
+        .arrayLayers = tex.layers,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    const VmaAllocationCreateInfo allocInfo{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VK_CHECK(vmaCreateImage(m_ctx.allocator(), &imageInfo, &allocInfo, &m_textureImage, &m_textureAllocation, nullptr));
+
+    Buffer staging =
+        createBuffer(m_ctx.allocator(), tex.pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryKind::Upload);
+    std::memcpy(staging.mapped, tex.pixels.data(), tex.pixels.size());
+    VK_CHECK(vmaFlushAllocation(m_ctx.allocator(), staging.allocation, 0, VK_WHOLE_SIZE));
+
+    // One copy region per mip level; each covers every layer of that level.
+    std::vector<VkBufferImageCopy> regions(tex.mipLevels);
+    for (u32 level = 0; level < tex.mipLevels; ++level) {
+        regions[level] = VkBufferImageCopy{
+            .bufferOffset = tex.levelOffsets[level],
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, tex.layers},
+            .imageExtent = {tex.levelSize(level), tex.levelSize(level), 1},
+        };
+    }
+    m_ctx.immediateSubmit([&](VkCommandBuffer cmd) {
+        const VkImageMemoryBarrier2 toTransfer = wholeImageBarrier(imageBarrier(
+            m_textureImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL));
+        pipelineBarriers(cmd, {&toTransfer, 1});
+        vkCmdCopyBufferToImage(cmd, staging.buffer, m_textureImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               static_cast<u32>(regions.size()), regions.data());
+        const VkImageMemoryBarrier2 toShader = wholeImageBarrier(imageBarrier(
+            m_textureImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+        pipelineBarriers(cmd, {&toShader, 1});
+    });
+    destroyBuffer(m_ctx.allocator(), staging);
+
+    const VkImageViewCreateInfo viewInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = m_textureImage,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+        .format = VK_FORMAT_R8G8B8A8_SRGB,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, tex.mipLevels, 0, tex.layers},
+    };
+    VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, &m_textureView));
+
+    // Crisp texels up close (nearest magnification), smooth and shimmer-free
+    // at a distance (trilinear + anisotropic minification).
+    const bool aniso = m_ctx.samplerAnisotropy();
+    const VkSamplerCreateInfo samplerInfo{
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_NEAREST,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .anisotropyEnable = aniso ? VK_TRUE : VK_FALSE,
+        .maxAnisotropy = aniso ? std::min(16.0f, m_ctx.properties().limits.maxSamplerAnisotropy) : 1.0f,
+        .maxLod = VK_LOD_CLAMP_NONE,
+    };
+    VK_CHECK(vkCreateSampler(device, &samplerInfo, nullptr, &m_sampler));
+
+    m_faceLayerBuffer = createBufferWithData(m_ctx, set.faceLayers.data(), set.faceLayers.size() * sizeof(u32),
+                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    const VkDescriptorImageInfo imageDescriptor{m_sampler, m_textureView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const VkDescriptorBufferInfo faceLayerDescriptor{m_faceLayerBuffer.buffer, 0, VK_WHOLE_SIZE};
+    const VkWriteDescriptorSet writes[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = m_set,
+            .dstBinding = 2,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &imageDescriptor,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = m_set,
+            .dstBinding = 3,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &faceLayerDescriptor,
+        },
+    };
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+}
+
 void Renderer::recreateSwapchain()
 {
     m_window.waitWhileMinimised();
@@ -604,7 +740,8 @@ void Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Ca
     };
     vkCmdBeginRendering(cmd, &renderingInfo);
 
-    if (drawCount > 0) {
+    // Every descriptor must be written before drawing (world + textures).
+    if (drawCount > 0 && m_textureImage != VK_NULL_HANDLE) {
         const VkViewport viewport{0.0f, 0.0f, static_cast<f32>(extent.width), static_cast<f32>(extent.height),
                                   0.0f, 1.0f};
         const VkRect2D scissor{{0, 0}, extent};

@@ -227,8 +227,13 @@ void VulkanContext::createDevice()
         .pQueuePriorities = &priority,
     };
 
+    VkPhysicalDeviceFeatures available;
+    vkGetPhysicalDeviceFeatures(m_physicalDevice, &available);
+    m_samplerAnisotropy = available.samplerAnisotropy == VK_TRUE; // optional; universal on desktop
+
     RequiredFeatures features;
     features.setRequired();
+    features.core.features.samplerAnisotropy = available.samplerAnisotropy;
     const char* extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
     const VkDeviceCreateInfo info{

@@ -78,7 +78,12 @@ if(ENGINE_BUILD_RENDERER)
         GIT_TAG        7b6aead9fb88b3623e3b3725ebb42670cbe4c579  # 3.4
         SYSTEM)
 
-    FetchContent_MakeAvailable(vulkan_headers volk vma glm glfw)
+    FetchContent_Declare(stb
+        GIT_REPOSITORY https://github.com/nothings/stb.git
+        GIT_TAG        6b5799bae8a1fe3792691ef4b72ae26434c3e799  # master, 2025
+        SOURCE_SUBDIR  _download_only)
+
+    FetchContent_MakeAvailable(vulkan_headers volk vma glm glfw stb)
     # GLFW is C and off the hot path: LTO gains nothing there, and with Clang
     # its archive would need llvm-ar to be linkable.
     set_target_properties(glfw PROPERTIES
@@ -97,6 +102,10 @@ if(ENGINE_BUILD_RENDERER)
         VMA_STATIC_VULKAN_FUNCTIONS=0
         VMA_DYNAMIC_VULKAN_FUNCTIONS=1)
     target_link_libraries(engine_vulkan_headers INTERFACE ${CMAKE_DL_LIBS})
+
+    add_library(engine_stb INTERFACE)
+    add_library(thirdparty::stb ALIAS engine_stb)
+    target_include_directories(engine_stb SYSTEM INTERFACE ${stb_SOURCE_DIR})
 
     add_library(engine_glm INTERFACE)
     add_library(thirdparty::glm ALIAS engine_glm)

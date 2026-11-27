@@ -11,6 +11,7 @@
 
 layout(std430, set = 0, binding = 0) readonly buffer QuadBuffer { uvec2 quads[]; };
 layout(std430, set = 0, binding = 1) readonly buffer ChunkBuffer { ivec4 chunkOrigins[]; };
+layout(std430, set = 0, binding = 3) readonly buffer FaceLayerBuffer { uint faceLayers[]; }; // [block * 6 + face]
 
 layout(push_constant) uniform PushConstants {
     mat4 viewProj;
@@ -18,8 +19,10 @@ layout(push_constant) uniform PushConstants {
     vec4 fog;       // rgb = colour (linear), a = distance of full fog
 } pc;
 
-layout(location = 0) flat out vec3 outColor;
+layout(location = 0) out vec2 outUV;
 layout(location = 1) out float outDistance;
+layout(location = 2) flat out uint outLayer;
+layout(location = 3) flat out float outShade;
 
 // Per face (PosX, NegX, PosY, NegY, PosZ, NegZ): base corner, U axis, V axis.
 // U x V points out of the block, so corners (0,0) (1,0) (0,1) (1,1) wound
@@ -31,17 +34,19 @@ const vec3 kV[6]    = vec3[6](vec3(0, 0, 1), vec3(0, 1, 0), vec3(1, 0, 0), vec3(
 // Cheap directional lighting baked per face.
 const float kShade[6] = float[6](0.80, 0.80, 1.00, 0.50, 0.65, 0.65);
 
-// Linear-space colours by block id: 0 air (magenta = bug), 1 stone, 2 dirt, 3 grass.
-const vec3 kBlockColor[4] = vec3[4](vec3(1.0, 0.0, 1.0), vec3(0.20, 0.20, 0.22), vec3(0.16, 0.08, 0.035),
-                                    vec3(0.10, 0.28, 0.045));
-
-uint hash3(uvec3 p)
+// Texture coordinates from the corner's position inside the block (0..1 on
+// each axis). Side faces put the texture's top edge at the block's top and
+// read left-to-right when seen from outside; top/bottom faces map x/z.
+vec2 faceUV(uint face, vec3 o)
 {
-    uint h = (p.x * 73856093u) ^ (p.y * 19349663u) ^ (p.z * 83492791u);
-    h ^= h >> 13;
-    h *= 0x5bd1e995u;
-    h ^= h >> 15;
-    return h;
+    switch (face) {
+    case 0u: return vec2(1.0 - o.z, 1.0 - o.y); // +X
+    case 1u: return vec2(o.z, 1.0 - o.y);       // -X
+    case 2u: return vec2(o.x, o.z);             // +Y
+    case 3u: return vec2(o.x, 1.0 - o.z);       // -Y
+    case 4u: return vec2(o.x, 1.0 - o.y);       // +Z
+    default: return vec2(1.0 - o.x, 1.0 - o.y); // -Z
+    }
 }
 
 void main()
@@ -55,12 +60,13 @@ void main()
     const uint block = q.y & 0xFFFFu;
 
     const ivec3 voxel = chunkOrigins[gl_InstanceIndex].xyz + ivec3(local);
-    const vec2 uv = vec2(float(corner & 1u), float(corner >> 1));
-    const vec3 pos = vec3(voxel) + kBase[face] + kU[face] * uv.x + kV[face] * uv.y;
+    const vec2 corner2 = vec2(float(corner & 1u), float(corner >> 1));
+    const vec3 inBlock = kBase[face] + kU[face] * corner2.x + kV[face] * corner2.y;
+    const vec3 pos = vec3(voxel) + inBlock;
     gl_Position = pc.viewProj * vec4(pos, 1.0);
 
-    // Per-voxel brightness jitter so flat areas read as individual blocks.
-    const float jitter = 0.92 + 0.16 * float(hash3(uvec3(voxel)) & 255u) / 255.0;
-    outColor = kBlockColor[min(block, 3u)] * kShade[face] * jitter;
+    outUV = faceUV(face, inBlock);
+    outLayer = faceLayers[block * 6u + face];
+    outShade = kShade[face];
     outDistance = distance(pos, pc.cameraPos.xyz);
 }

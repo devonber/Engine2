@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/core/Types.hpp"
+#include "engine/render/BlockTextures.hpp"
 #include "engine/render/Swapchain.hpp"
 #include "engine/render/VulkanContext.hpp"
 #include "engine/voxel/Mesher.hpp"
@@ -49,6 +50,10 @@ public:
     // quads[chunks[i].firstQuad .. +quadCount]. Stalls the GPU; load-time only.
     void uploadWorld(std::span<const voxel::PackedQuad> quads, std::span<const ChunkDraw> chunks);
 
+    // Upload block textures and the (block, face) -> texture layer table.
+    // Must be called before anything is drawn. Stalls the GPU; load-time only.
+    void setBlockTextures(const BlockTextureSet& textures);
+
     FrameStats renderFrame(const Camera& camera);
 
     // Write the next rendered frame to a 24-bit .bmp file.
@@ -69,6 +74,7 @@ private:
     void destroyDepth();
     void createIndexBuffer();
     void destroyWorld();
+    void destroyTextures();
     void recreateSwapchain();
     [[nodiscard]] u32 cullAndWriteDraws(Frame& frame, const Camera& camera, u64& drawnQuads) const;
     void recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Camera& camera, bool screenshot);
@@ -95,6 +101,12 @@ private:
     Buffer m_quadBuffer;
     Buffer m_chunkBuffer;
     std::vector<ChunkDraw> m_chunks;
+
+    VkImage m_textureImage = VK_NULL_HANDLE;
+    VmaAllocation m_textureAllocation = nullptr;
+    VkImageView m_textureView = VK_NULL_HANDLE;
+    VkSampler m_sampler = VK_NULL_HANDLE;
+    Buffer m_faceLayerBuffer;
 
     std::array<Frame, kFramesInFlight> m_frames{};
     u32 m_frameIndex = 0;

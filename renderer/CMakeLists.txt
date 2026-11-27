@@ -1,7 +1,7 @@
 # ---- Third-party implementation units (volk, VMA) -------------------------------
 # Kept in their own library so our strict warnings never apply to their code.
 add_library(engine_vk_thirdparty STATIC src/ThirdPartyImpl.cpp)
-target_link_libraries(engine_vk_thirdparty PUBLIC thirdparty::vulkan)
+target_link_libraries(engine_vk_thirdparty PUBLIC thirdparty::vulkan thirdparty::stb)
 
 # ---- Shaders: GLSL -> SPIR-V, embedded as C arrays (glslc -mfmt=c) ---------------
 set(_shader_out ${CMAKE_CURRENT_BINARY_DIR}/shaders)
@@ -27,6 +27,7 @@ endforeach()
 
 # ---- Renderer ------------------------------------------------------------------------
 add_library(engine_renderer STATIC
+    src/BlockTextures.cpp
     src/Renderer.cpp
     src/Swapchain.cpp
     src/VulkanContext.cpp
@@ -40,7 +41,7 @@ target_include_directories(engine_renderer
     PRIVATE ${_shader_out})
 target_link_libraries(engine_renderer
     PUBLIC  engine::engine thirdparty::vulkan thirdparty::glm
-    PRIVATE engine_vk_thirdparty glfw)
+    PRIVATE engine_vk_thirdparty thirdparty::stb glfw)
 
 file(GLOB_RECURSE _renderer_headers CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp)
 target_sources(engine_renderer PRIVATE ${_renderer_headers})

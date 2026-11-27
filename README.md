@@ -76,13 +76,17 @@ Vulkan 1.3, written for throughput:
 - **Reversed-Z, infinite far plane** with a 32-bit float depth buffer: even depth precision at any distance.
 - **volk** loads Vulkan functions directly from the driver, skipping the loader's dispatch on each call.
 - **Dynamic rendering + synchronization2**: no render pass or framebuffer objects.
+- **Block textures** live in `assets/textures/*.png` (see the README there), packed into one texture
+  array with CPU-built mipmaps (filtered in linear space). Sampling is nearest-neighbour up close and
+  trilinear + 16x anisotropic at a distance. Which texture goes on which face is set per block in
+  `engine/include/engine/voxel/Blocks.hpp`.
 - Shaders are compiled at build time and embedded in the executable.
 
 Sandbox controls: left-click to capture the mouse, Esc to release; WASD to move, Space/Shift for
 up/down, Ctrl for speed. Frame rate, CPU and GPU times are shown in the title bar.
 
 Sandbox options: `--radius N` (world size in chunks), `--vsync`, `--validation` / `--no-validation`,
-`--camera x,y,z,yawDeg,pitchDeg`, `--frames N` (quit after N frames), `--screenshot file.bmp`.
+`--camera x,y,z,yawDeg,pitchDeg`, `--assets DIR`, `--frames N` (quit after N frames), `--screenshot file.bmp`.
 
 Validation is on by default in Debug builds. For deeper checks, set these environment variables
 (in Visual Studio: right-click `sandbox.exe` → *Add Debug Configuration* → `"env"`):

@@ -34,6 +34,7 @@ public:
     [[nodiscard]] u32 queueFamily() const noexcept { return m_queueFamily; }
     [[nodiscard]] VmaAllocator allocator() const noexcept { return m_allocator; }
     [[nodiscard]] const VkPhysicalDeviceProperties& properties() const noexcept { return m_properties; }
+    [[nodiscard]] bool samplerAnisotropy() const noexcept { return m_samplerAnisotropy; }
 
     // Record and run commands synchronously. For uploads at load time only;
     // it stalls the GPU.
@@ -63,6 +64,7 @@ private:
     u32 m_queueFamily = 0;
     VmaAllocator m_allocator = nullptr;
     VkCommandPool m_immediatePool = VK_NULL_HANDLE;
+    bool m_samplerAnisotropy = false;
 };
 
 // GPU buffer + its VMA allocation. `mapped` is non-null for host-visible buffers.
