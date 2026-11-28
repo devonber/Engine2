@@ -84,7 +84,8 @@ public:
 
     // Add or replace the mesh of the chunk identified by `key`; `origin` is the
     // world position (in blocks) of its voxel (0,0,0). At level of detail L
-    // each voxel is 2^L blocks wide (a chunk covers 32 * 2^L blocks). The quads are copied. Uploaded in the background
+    // each voxel is 2^L blocks wide and 2^min(L, 2) tall (voxel::lodScale,
+    // voxel::lodVerticalScale). The quads are copied. Uploaded in the background
     // over the next frames (see RendererDesc::uploadBudgetBytes). False if there is no room. Call between frames.
     bool setChunkMesh(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads, u32 level = 0);
     void removeChunkMesh(u64 key);

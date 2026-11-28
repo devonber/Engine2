@@ -3,6 +3,7 @@
 #include "engine/core/Profile.hpp"
 #include "engine/platform/Window.hpp"
 #include "engine/render/Camera.hpp"
+#include "engine/voxel/Generate.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -1143,9 +1144,10 @@ Renderer::DrawCounts Renderer::cullAndWriteDraws(Frame& frame, const Camera& cam
         if (!c.drawable || c.quadCount == 0) {
             continue;
         }
-        const f32 size = static_cast<f32>(voxel::kChunkSize << c.level);
+        const f32 width = static_cast<f32>(voxel::kChunkSize) * static_cast<f32>(voxel::lodScale(c.level));
+        const f32 height = static_cast<f32>(voxel::kChunkSize) * static_cast<f32>(voxel::lodVerticalScale(c.level));
         const glm::vec3 min = glm::vec3{c.origin - camBlock} - camFrac; // chunk box, camera at 0
-        const glm::vec3 max = min + size;
+        const glm::vec3 max = min + glm::vec3{width, height, width};
 
         // Shadow casters: full-detail chunks in each cascade's box, faces
         // towards the light (the same tests as cull.comp).

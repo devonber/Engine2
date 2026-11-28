@@ -340,8 +340,10 @@ int main(int argc, char** argv)
                 if (e.removed) {
                     renderer.removeChunkMesh(e.coord.key(level));
                 } else {
-                    const i32 n = static_cast<i32>(voxel::kChunkSize) << level; // blocks per chunk
-                    renderer.setChunkMesh(e.coord.key(level), {e.coord.x * n, e.coord.y * n, e.coord.z * n}, e.quads,
+                    // Blocks per chunk, horizontally and vertically.
+                    const i32 n = static_cast<i32>(voxel::kChunkSize) * voxel::lodScale(level);
+                    const i32 v = static_cast<i32>(voxel::kChunkSize) * voxel::lodVerticalScale(level);
+                    renderer.setChunkMesh(e.coord.key(level), {e.coord.x * n, e.coord.y * v, e.coord.z * n}, e.quads,
                                           level);
                     streamer->recycle(std::move(e.quads)); // the renderer copied it: reuse the vector
                 }

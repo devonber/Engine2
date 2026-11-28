@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -66,32 +67,49 @@ TEST_CASE("Terrain columns have the expected layering")
     }
 }
 
-TEST_CASE("Coarse levels of detail: cells are solid where the surface covers at least half of them")
+TEST_CASE("Coarse levels of detail: cells follow the average surface over their footprint")
 {
+    const auto floorDiv = [](i32 a, i32 b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
+    // Full-resolution height of block column (bx, bz).
+    std::map<std::pair<i32, i32>, TerrainColumn> fineColumns;
+    const auto blockHeight = [&](i32 bx, i32 bz) {
+        const std::pair key{floorDiv(bx, 32), floorDiv(bz, 32)};
+        auto it = fineColumns.find(key);
+        if (it == fineColumns.end()) {
+            it = fineColumns.emplace(key, TerrainColumn{}).first;
+            terrainColumn(key.first, key.second, it->second);
+        }
+        return it->second.height[static_cast<usize>((bz - key.second * 32) * 32 + (bx - key.first * 32))];
+    };
     auto chunk = std::make_unique<Chunk>();
-    for (u32 level = 1; level <= 4; ++level) {
+    for (u32 level = 1; level <= 7; ++level) {
         CAPTURE(level);
         const i32 scale = lodScale(level);
+        const i32 vscale = lodVerticalScale(level);
+        CHECK(vscale <= 4);
         const i32 layers = worldHeightChunks(level);
         for (const auto& [cx, cz] : {std::pair{0, 0}, std::pair{3, -2}, std::pair{-5, 7}}) {
             TerrainColumn column;
             terrainColumn(cx, cz, column, level);
-            for (u32 z = 0; z < kChunkSize; z += 5) {
-                for (u32 x = 0; x < kChunkSize; x += 3) {
-                    // The full-resolution height at the cell's centre block.
-                    const i32 bx = (cx * static_cast<i32>(kChunkSize) + static_cast<i32>(x)) * scale + scale / 2;
-                    const i32 bz = (cz * static_cast<i32>(kChunkSize) + static_cast<i32>(z)) * scale + scale / 2;
-                    const auto floorDiv = [](i32 a, i32 b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
-                    TerrainColumn fine;
-                    terrainColumn(floorDiv(bx, 32), floorDiv(bz, 32), fine);
-                    const i32 blocks = fine.height[static_cast<usize>((bz - floorDiv(bz, 32) * 32) * 32 +
-                                                                      (bx - floorDiv(bx, 32) * 32))];
+            for (u32 z = 0; z < kChunkSize; z += 11) {
+                for (u32 x = 0; x < kChunkSize; x += 7) {
+                    // Mean full-resolution height over the cell (sampled for big cells).
+                    const i32 step = std::max(1, scale / 32); // fine enough for the shortest hills (27 blocks)
+                    f64 sum = 0.0;
+                    int samples = 0;
+                    for (i32 dz = 0; dz < scale; dz += step) {
+                        for (i32 dx = 0; dx < scale; dx += step) {
+                            sum += blockHeight((cx * 32 + static_cast<i32>(x)) * scale + dx,
+                                               (cz * 32 + static_cast<i32>(z)) * scale + dz);
+                            ++samples;
+                        }
+                    }
+                    const f64 mean = sum / samples;
                     const i32 cells = column.height[z * kChunkSize + x];
-                    CAPTURE(blocks);
+                    CAPTURE(mean);
                     CAPTURE(cells);
-                    // Rounded to the nearest cell (at least one: the world has a floor).
-                    CHECK(cells == std::max(1, (blocks + scale / 2) >> level));
-                    CHECK((cells == 1 || std::abs(cells * scale - blocks) <= scale / 2));
+                    // Within half a cell, plus rounding of the block heights.
+                    CHECK(std::abs(cells * vscale - mean) <= vscale * 0.5 + 1.0);
                     CHECK(cells < layers * static_cast<i32>(kChunkSize)); // fits the level's layers
                 }
             }

@@ -25,15 +25,33 @@ void terrainColumn(i32 chunkX, i32 chunkZ, TerrainColumn& out, u32 level)
     const i32 scale = lodScale(level);
     const i32 baseX = chunkX * n * scale;
     const i32 baseZ = chunkZ * n * scale;
-    const i32 centre = scale / 2; // sample cells at their centre (level 0: the block itself)
+    // Sample cells at their centre: blocks b .. b + scale - 1 (level 0: the block itself).
+    const f32 centre = static_cast<f32>(scale - 1) * 0.5f;
+    const u32 vlevel = lodVerticalLevel(level);
+    const i32 vscale = lodVerticalScale(level);
+
+    // Box filter for coarse levels: the average of sin(k x + p) over a cell
+    // of width w centred on x is sinc(k w / 2) * sin(k x + p), so averaging a
+    // term of the heightmap over the cell just scales its amplitude. Products
+    // f(x) g(z) take one factor per axis; f(x + z) over a square, two.
+    const auto average = [scale, level](f32 k) {
+        if (level == 0) {
+            return 1.0f; // blocks are sampled exactly
+        }
+        const f32 a = k * static_cast<f32>(scale) * 0.5f;
+        return std::sin(a) / a;
+    };
+    const f32 bigAmp = 40.0f * average(0.0123f) * average(0.0171f);
+    const f32 hillAmp = 6.0f * average(0.11f) * average(0.07f);
+    const f32 ridgeAmp = 3.0f * average(0.23f) * average(0.23f);
 
     // Every term is f(x) * g(z) or f(x + z), so per column of chunks the trig
     // is 2 x 32 + 2 x 32 + 63 calls instead of 5 per block column.
     std::array<f32, kChunkSize> sinX, cosZ, bigX, bigZ;
     std::array<f32, 2 * kChunkSize - 1> sinXZ;
     for (i32 i = 0; i < n; ++i) {
-        const f32 wx = static_cast<f32>(baseX + i * scale + centre);
-        const f32 wz = static_cast<f32>(baseZ + i * scale + centre);
+        const f32 wx = static_cast<f32>(baseX + i * scale) + centre;
+        const f32 wz = static_cast<f32>(baseZ + i * scale) + centre;
         sinX[static_cast<usize>(i)] = std::sin(wx * 0.11f);
         cosZ[static_cast<usize>(i)] = std::cos(wz * 0.07f);
         bigX[static_cast<usize>(i)] = std::sin(wx * 0.0123f); // mountains/valleys, ~500 blocks across
@@ -41,7 +59,7 @@ void terrainColumn(i32 chunkX, i32 chunkZ, TerrainColumn& out, u32 level)
     }
     for (i32 i = 0; i < 2 * n - 1; ++i) {
         // wx + wz of cells x and z with x + z = i
-        sinXZ[static_cast<usize>(i)] = std::sin(static_cast<f32>(baseX + baseZ + i * scale + 2 * centre) * 0.23f);
+        sinXZ[static_cast<usize>(i)] = std::sin((static_cast<f32>(baseX + baseZ + i * scale) + 2.0f * centre) * 0.23f);
     }
 
     out.level = level;
@@ -49,17 +67,17 @@ void terrainColumn(i32 chunkX, i32 chunkZ, TerrainColumn& out, u32 level)
     // shows: sand 3 blocks deep covers the terraces of lowland terrain; if it
     // were rounded down (1 cell at level 1), 2-cell steps would expose dirt
     // as specks all over distant sand.
-    const auto cellsCovering = [level](i32 blocks) { return (blocks + lodScale(level) - 1) >> level; };
+    const auto cellsCovering = [vlevel, vscale](i32 blocks) { return (blocks + vscale - 1) >> vlevel; };
     out.dirtDepth = cellsCovering(4);
     const i16 sandCells = static_cast<i16>(cellsCovering(3));
     out.minHeight = kWorldHeight;
     out.maxHeight = 0;
     for (u32 z = 0; z < kChunkSize; ++z) {
         for (u32 x = 0; x < kChunkSize; ++x) {
-            const f32 h = 48.0f + 40.0f * bigX[x] * bigZ[z] + 6.0f * sinX[x] * cosZ[z] + 3.0f * sinXZ[x + z];
+            const f32 h = 48.0f + bigAmp * bigX[x] * bigZ[z] + hillAmp * sinX[x] * cosZ[z] + ridgeAmp * sinXZ[x + z];
             const i32 blocks = std::clamp(static_cast<i32>(h), 1, kWorldHeight - 1);
             // Cells that are at least half covered are solid (level 0: blocks).
-            const i32 cells = std::max(1, (blocks + centre) >> level);
+            const i32 cells = std::max(1, (blocks + vscale / 2) >> vlevel);
             out.minHeight = std::min(out.minHeight, cells);
             out.maxHeight = std::max(out.maxHeight, cells);
             out.height[z * kChunkSize + x] = static_cast<i16>(cells);
