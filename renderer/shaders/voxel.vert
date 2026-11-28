@@ -100,7 +100,17 @@ void main()
     const ivec3 voxel = chunk.originFirst.xyz + (ivec3(local) << level) - pc.cameraBlock.xyz;
     const vec2 corner2 = vec2(float(corner & 1u), float(corner >> 1));
     const vec3 inBlock = kBase[face] + kU[face] * (corner2.x * size.x) + kV[face] * (corner2.y * size.y);
-    const vec3 pos = vec3(voxel) - pc.cameraFraction.xyz + inBlock * float(1u << level); // relative to the camera
+    vec3 pos = vec3(voxel) - pc.cameraFraction.xyz + inBlock * float(1u << level); // relative to the camera
+
+    // Greedy meshing leaves T-junctions: a long quad edge runs along the
+    // edges of several shorter quads, which meet it at vertices it does not
+    // have. Mathematically the edges coincide, but they are rasterised from
+    // different vertices, so pixels whose centre lies on the line can fall
+    // through both: pinholes showing the sky. Grow every quad a hair within
+    // its own plane (a small fraction of a pixel at any distance) so
+    // neighbours overlap instead of merely touching.
+    const float grow = max(1.0 / 1024.0, length(pos) * 1e-4);
+    pos += (kU[face] * (corner2.x * 2.0 - 1.0) + kV[face] * (corner2.y * 2.0 - 1.0)) * grow;
     gl_Position = pc.viewProj * vec4(pos, 1.0);
     if (level > 0u) {
         // Where a coarse level overlaps the finer one (just beyond a seam),
