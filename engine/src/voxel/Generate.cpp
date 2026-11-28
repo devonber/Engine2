@@ -15,58 +15,85 @@
 namespace engine::voxel {
 
 namespace {
-constexpr u32 kSandLevel = 12;
+constexpr i32 kSandLevel = 30; // columns whose surface is at or below this are sand
 } // namespace
 
-void fillTerrain(Chunk& chunk, i32 chunkX, i32 chunkZ)
+void terrainColumn(i32 chunkX, i32 chunkZ, TerrainColumn& out)
 {
     ENGINE_PROFILE_FUNCTION();
     constexpr i32 n = static_cast<i32>(kChunkSize);
     const i32 baseX = chunkX * n;
     const i32 baseZ = chunkZ * n;
 
-    // The height function is sin(x) * cos(z) + sin(x + z): its trig terms
-    // depend on x, z or x + z alone, so 32 + 32 + 63 calls replace 3 per column.
-    std::array<f32, kChunkSize> sinX, cosZ;
+    // Every term is f(x) * g(z) or f(x + z), so per column of chunks the trig
+    // is 2 x 32 + 2 x 32 + 63 calls instead of 5 per block column.
+    std::array<f32, kChunkSize> sinX, cosZ, bigX, bigZ;
     std::array<f32, 2 * kChunkSize - 1> sinXZ;
     for (i32 i = 0; i < n; ++i) {
-        sinX[static_cast<usize>(i)] = std::sin(static_cast<f32>(baseX + i) * 0.11f);
-        cosZ[static_cast<usize>(i)] = std::cos(static_cast<f32>(baseZ + i) * 0.07f);
+        const f32 wx = static_cast<f32>(baseX + i);
+        const f32 wz = static_cast<f32>(baseZ + i);
+        sinX[static_cast<usize>(i)] = std::sin(wx * 0.11f);
+        cosZ[static_cast<usize>(i)] = std::cos(wz * 0.07f);
+        bigX[static_cast<usize>(i)] = std::sin(wx * 0.0123f); // mountains/valleys, ~500 blocks across
+        bigZ[static_cast<usize>(i)] = std::cos(wz * 0.0171f);
     }
     for (i32 i = 0; i < 2 * n - 1; ++i) {
-        // (wx + wz) as in the per-column formula; both are exact small integers.
         sinXZ[static_cast<usize>(i)] = std::sin(static_cast<f32>(baseX + baseZ + i) * 0.23f);
     }
 
-    // Pass 1: per column, the surface height and how deep sand goes (3 blocks
-    // in lowland, beaches/valleys; 0 elsewhere). 16-bit like the block ids, so
-    // pass 2 vectorises without widening or narrowing.
-    std::array<i16, kChunkArea> height;
-    std::array<i16, kChunkArea> sandDepth;
-    i32 minHeight = n;
-    i32 maxHeight = 0;
+    out.minHeight = kWorldHeight;
+    out.maxHeight = 0;
     for (u32 z = 0; z < kChunkSize; ++z) {
         for (u32 x = 0; x < kChunkSize; ++x) {
-            const f32 h = 16.0f + 6.0f * sinX[x] * cosZ[z] + 3.0f * sinXZ[x + z];
-            const i32 hi = std::clamp(static_cast<i32>(h), 1, n - 1);
-            minHeight = std::min(minHeight, hi);
-            maxHeight = std::max(maxHeight, hi);
-            height[z * kChunkSize + x] = static_cast<i16>(hi);
-            sandDepth[z * kChunkSize + x] = static_cast<i16>(hi <= static_cast<i32>(kSandLevel) ? 3 : 0);
+            const f32 h = 48.0f + 40.0f * bigX[x] * bigZ[z] + 6.0f * sinX[x] * cosZ[z] + 3.0f * sinXZ[x + z];
+            const i32 hi = std::clamp(static_cast<i32>(h), 1, kWorldHeight - 1);
+            out.minHeight = std::min(out.minHeight, hi);
+            out.maxHeight = std::max(out.maxHeight, hi);
+            out.height[z * kChunkSize + x] = static_cast<i16>(hi);
+            out.sandDepth[z * kChunkSize + x] = static_cast<i16>(hi <= kSandLevel ? 3 : 0);
         }
     }
+}
 
-    // Pass 2: fill one horizontal layer at a time. Layers are contiguous in
-    // memory (x fastest, then z), so this is a linear write instead of a
-    // column walk that jumps 2 KiB per step.
+ChunkContent classifyTerrainChunk(const TerrainColumn& column, i32 chunkY) noexcept
+{
+    const i32 bottom = chunkY * static_cast<i32>(kChunkSize);
+    const i32 top = bottom + static_cast<i32>(kChunkSize) - 1;
+    if (bottom >= column.maxHeight) {
+        return ChunkContent::Air; // entirely above the surface
+    }
+    if (top + 4 < column.minHeight) {
+        return ChunkContent::Stone; // entirely below the surface layers (depth > 4)
+    }
+    return ChunkContent::Mixed;
+}
+
+void fillTerrain(Chunk& chunk, i32 chunkX, i32 chunkY, i32 chunkZ)
+{
+    TerrainColumn column;
+    terrainColumn(chunkX, chunkZ, column);
+    fillTerrainChunk(chunk, column, chunkY);
+}
+
+void fillTerrainChunk(Chunk& chunk, const TerrainColumn& column, i32 chunkY)
+{
+    ENGINE_PROFILE_FUNCTION();
+    constexpr i32 n = static_cast<i32>(kChunkSize);
+    const auto& height = column.height;
+    const auto& sandDepth = column.sandDepth;
+
+    // One horizontal layer at a time. Layers are contiguous in memory (x
+    // fastest, then z), so this is a linear write instead of a column walk
+    // that jumps 2 KiB per step.
     BlockId* ENGINE_RESTRICT out = chunk.blocks().data();
-    for (i32 y = 0; y < n; ++y) {
-        BlockId* ENGINE_RESTRICT layer = out + static_cast<usize>(y) * kChunkArea;
-        if (y >= maxHeight) {
+    for (i32 ly = 0; ly < n; ++ly) {
+        const i32 y = chunkY * n + ly; // world y
+        BlockId* ENGINE_RESTRICT layer = out + static_cast<usize>(ly) * kChunkArea;
+        if (y >= column.maxHeight) {
             std::fill_n(layer, kChunkArea, kAir);
             continue;
         }
-        if (y + 4 < minHeight) {
+        if (y + 4 < column.minHeight) {
             std::fill_n(layer, kChunkArea, blocks::Stone); // deep underground: no surface layers
             continue;
         }

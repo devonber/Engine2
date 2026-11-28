@@ -2,8 +2,7 @@ add_library(engine STATIC
     src/core/ThreadPool.cpp
     src/voxel/ChunkStreamer.cpp
     src/voxel/Generate.cpp
-    src/voxel/Mesher.cpp
-    src/voxel/World.cpp)
+    src/voxel/Mesher.cpp)
 add_library(engine::engine ALIAS engine)
 
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

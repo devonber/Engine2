@@ -168,7 +168,7 @@ TEST_CASE("Fast meshers match the naive reference")
     SUBCASE("terrain, no neighbours")
     {
         for (i32 c = -3; c <= 3; ++c) {
-            fillTerrain(*chunk, c, c * 7);
+            fillTerrain(*chunk, c, 1, c * 7);
             checkMeshersAgree(*chunk);
         }
     }
@@ -184,11 +184,11 @@ TEST_CASE("Fast meshers match the naive reference")
     {
         auto px = std::make_unique<Chunk>(), nx = std::make_unique<Chunk>();
         auto pz = std::make_unique<Chunk>(), nz = std::make_unique<Chunk>();
-        fillTerrain(*chunk, 2, 5);
-        fillTerrain(*px, 3, 5);
-        fillTerrain(*nx, 1, 5);
-        fillTerrain(*pz, 2, 6);
-        fillTerrain(*nz, 2, 4);
+        fillTerrain(*chunk, 2, 1, 5);
+        fillTerrain(*px, 3, 1, 5);
+        fillTerrain(*nx, 1, 1, 5);
+        fillTerrain(*pz, 2, 1, 6);
+        fillTerrain(*nz, 2, 1, 4);
         ChunkNeighbours n;
         n.chunks[static_cast<usize>(Face::PosX)] = px.get();
         n.chunks[static_cast<usize>(Face::NegX)] = nx.get();
@@ -246,7 +246,7 @@ TEST_CASE("Outer layers give the same boundary masks as reading the neighbours")
 
     // And on structured terrain.
     auto terrain = std::make_unique<Chunk>();
-    fillTerrain(*terrain, 3, -2);
+    fillTerrain(*terrain, 3, 1, -2);
     const OuterLayers t = computeOuterLayers(*terrain);
     for (u32 f = 0; f < kFaceCount; ++f) {
         ChunkNeighbours one;
