@@ -30,6 +30,7 @@ struct RendererDesc {
     u64 quadCapacity = 8u * 1024 * 1024;      // initial quads in the shared buffer (8 bytes each: 64 MiB); grows
     u64 uploadBudgetBytes = 4u * 1024 * 1024; // mesh data copied to the GPU per frame, at most
     bool faceCulling = true;                  // skip each chunk's face directions that point away from the camera
+    bool gpuCulling = true; // cull on the GPU (compute + draw-indirect-count); on the CPU if off or unsupported
 };
 
 struct FrameStats {
@@ -37,8 +38,9 @@ struct FrameStats {
     u32 drawnChunks = 0; // chunks that passed frustum/distance culling
     u32 draws = 0;       // indirect draws (up to 3 per chunk: runs of face directions)
     u64 drawnQuads = 0;
-    f64 cullMs = 0.0;      // CPU time culling chunks and writing the draws
-    u64 uploadedBytes = 0; // mesh data copied to the GPU this frame
+    f64 cullMs = 0.0;       // CPU time culling chunks and writing the draws (CPU culling only)
+    bool gpuCulled = false; // counts above come from the GPU, a couple of frames late
+    u64 uploadedBytes = 0;  // mesh data copied to the GPU this frame
 };
 
 struct MeshMemoryStats {
@@ -69,6 +71,7 @@ public:
     bool setChunkMesh(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads);
     void removeChunkMesh(u64 key);
     [[nodiscard]] MeshMemoryStats meshStats() const;
+    [[nodiscard]] bool gpuCulling() const noexcept { return m_gpuCulling; }
 
     // Upload block textures and the (block, face) -> texture layer table.
     // Must be called before anything is drawn. Stalls the GPU; load-time only.
@@ -85,11 +88,22 @@ private:
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkFence inFlight = VK_NULL_HANDLE;
         VkSemaphore imageAcquired = VK_NULL_HANDLE;
-        Buffer indirect; // VkDrawIndexedIndirectCommand per visible chunk, written by the CPU
+        Buffer indirect; // CPU culling: VkDrawIndexedIndirectCommand per visible run, written by the CPU
         bool timestampsWritten = false;
+
+        // GPU culling: draws written by the culling compute shader, the draw
+        // count + statistics, and a host-readable copy of the counters.
+        Buffer gpuDraws;
+        Buffer counters;
+        Buffer countersReadback;
+        VkDescriptorSet cullSet = VK_NULL_HANDLE;
+        bool countersWritten = false;
     };
 
     void createPipeline();
+    void createCulling();
+    void destroyCulling();
+    void recordCulling(VkCommandBuffer cmd, Frame& frame, const Camera& camera) const;
     void createDepth();
     void destroyDepth();
     void createIndexBuffer();
@@ -119,6 +133,14 @@ private:
 
     Buffer m_indexBuffer; // shared quad index pattern, sized for the densest possible chunk
     std::unique_ptr<ChunkMeshStore> m_meshes;
+
+    // GPU culling
+    bool m_gpuCulling = false;
+    u32 m_maxDraws = 0;
+    VkDescriptorSetLayout m_cullSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool m_cullPool = VK_NULL_HANDLE;
+    VkPipelineLayout m_cullPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_cullPipeline = VK_NULL_HANDLE;
 
     VkImage m_textureImage = VK_NULL_HANDLE;
     VmaAllocation m_textureAllocation = nullptr;

@@ -1,0 +1,110 @@
+#version 460
+
+// GPU-driven culling: one thread per chunk slot. Visible chunks append up to
+// three indexed-indirect draws (runs of face directions that can face the
+// camera); vkCmdDrawIndexedIndirectCount then draws exactly that many. The
+// tests match Renderer::cullAndWriteDraws (the CPU path).
+
+layout(local_size_x = 64) in;
+
+struct GpuChunk {
+    ivec4 originFirst; // xyz: world position of voxel (0,0,0); w: first quad
+    uvec4 faces0;      // faceStart[0..3]
+    uvec4 faces1;      // xyz: faceStart[4..6]; w: 1 if drawable
+};
+
+struct DrawCommand { // VkDrawIndexedIndirectCommand
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int vertexOffset;
+    uint firstInstance;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer ChunkTable { GpuChunk chunks[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer DrawBuffer { DrawCommand draws[]; };
+layout(std430, set = 0, binding = 2) buffer Counters {
+    uint drawCount; // read by vkCmdDrawIndexedIndirectCount
+    uint chunkCount;
+    uint quadCount;
+    uint unused;
+};
+
+layout(push_constant) uniform PushConstants {
+    ivec4 cameraBlock;    // xyz: integer block containing the camera
+    vec4 cameraFraction;  // xyz: camera position within it; w: squared culling distance
+    vec4 planes[5];       // camera-relative frustum (left, right, bottom, top, near)
+    uvec4 params;         // x: slot count, y: face culling on, z: draw buffer capacity
+} pc;
+
+void main()
+{
+    const uint slot = gl_GlobalInvocationID.x;
+    if (slot >= pc.params.x) {
+        return;
+    }
+    const GpuChunk c = chunks[slot];
+    if (c.faces1.w == 0u) {
+        return; // empty, removed, or not uploaded yet
+    }
+
+    // Chunk box relative to the camera (integer part exact).
+    const vec3 lo = vec3(c.originFirst.xyz - pc.cameraBlock.xyz) - pc.cameraFraction.xyz;
+    const vec3 hi = lo + 32.0;
+    const vec3 centre = (lo + hi) * 0.5;
+    if (dot(centre, centre) > pc.cameraFraction.w) {
+        return; // fully fogged
+    }
+    for (int i = 0; i < 5; ++i) {
+        const vec4 p = pc.planes[i];
+        // The box corner furthest along the plane normal.
+        const vec3 v = vec3(p.x >= 0.0 ? hi.x : lo.x, p.y >= 0.0 ? hi.y : lo.y, p.z >= 0.0 ? hi.z : lo.z);
+        if (dot(p.xyz, v) + p.w < 0.0) {
+            return;
+        }
+    }
+
+    // Face directions that can face the camera (camera at the origin).
+    const bool all = pc.params.y == 0u;
+    const bool visible[6] = bool[6](all || lo.x < 0.0, all || hi.x > 0.0,  // +X, -X
+                                    all || lo.y < 0.0, all || hi.y > 0.0,  // +Y, -Y
+                                    all || lo.z < 0.0, all || hi.z > 0.0); // +Z, -Z
+    const uint start[7] = uint[7](c.faces0.x, c.faces0.y, c.faces0.z, c.faces0.w, c.faces1.x, c.faces1.y, c.faces1.z);
+
+    // Contiguous runs of visible directions: at most 3.
+    uint runFirst[3];
+    uint runQuads[3];
+    uint runs = 0u;
+    uint quads = 0u;
+    uint f = 0u;
+    while (f < 6u) {
+        if (!visible[f]) {
+            ++f;
+            continue;
+        }
+        uint end = f + 1u;
+        while (end < 6u && visible[end]) {
+            ++end;
+        }
+        const uint count = start[end] - start[f];
+        if (count > 0u) {
+            runFirst[runs] = start[f];
+            runQuads[runs] = count;
+            ++runs;
+            quads += count;
+        }
+        f = end;
+    }
+    if (runs == 0u) {
+        return;
+    }
+
+    const uint base = atomicAdd(drawCount, runs);
+    atomicAdd(chunkCount, 1u);
+    atomicAdd(quadCount, quads);
+    for (uint r = 0u; r < runs; ++r) {
+        if (base + r < pc.params.z) { // the draw count is also clamped when drawing
+            draws[base + r] = DrawCommand(runQuads[r] * 6u, 1u, 0u, int((uint(c.originFirst.w) + runFirst[r]) * 4u), slot);
+        }
+    }
+}

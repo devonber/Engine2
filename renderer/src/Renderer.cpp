@@ -21,6 +21,9 @@ namespace {
 constexpr u32 kVoxelVertSpv[] =
 #include "voxel.vert.spv.inc"
     ;
+constexpr u32 kCullCompSpv[] =
+#include "cull.comp.spv.inc"
+    ;
 constexpr u32 kVoxelFragSpv[] =
 #include "voxel.frag.spv.inc"
     ;
@@ -40,6 +43,17 @@ struct PushConstants {
     glm::vec4 fog;
 };
 static_assert(sizeof(PushConstants) <= 128, "128 bytes is the guaranteed minimum push constant size");
+
+// Push constants of the culling compute shader (shaders/cull.comp).
+struct CullPushConstants {
+    glm::ivec4 cameraBlock;
+    glm::vec4 cameraFraction; // w: squared culling distance
+    glm::vec4 planes[5];
+    glm::uvec4 params; // x: slot count, y: face culling, z: draw capacity
+};
+static_assert(sizeof(CullPushConstants) == 128);
+
+constexpr u32 kCullGroupSize = 64; // local_size_x in cull.comp
 
 VkShaderModule createShaderModule(VkDevice device, std::span<const u32> spirv)
 {
@@ -152,7 +166,7 @@ Renderer::Renderer(VulkanContext& ctx, platform::Window& window, const RendererD
                                                 desc.uploadBudgetBytes);
     const VkDescriptorBufferInfo meshBuffers[] = {
         {m_meshes->quadBuffer(), 0, VK_WHOLE_SIZE},
-        {m_meshes->originBuffer(), 0, VK_WHOLE_SIZE},
+        {m_meshes->chunkTable(), 0, VK_WHOLE_SIZE},
     };
     VkWriteDescriptorSet meshWrites[2];
     for (u32 i = 0; i < 2; ++i) {
@@ -166,6 +180,7 @@ Renderer::Renderer(VulkanContext& ctx, platform::Window& window, const RendererD
         };
     }
     vkUpdateDescriptorSets(device, 2, meshWrites, 0, nullptr);
+    m_maxDraws = desc.maxChunks * 3; // up to 3 runs of face directions per chunk
 
     for (Frame& f : m_frames) {
         const VkCommandPoolCreateInfo cmdPoolInfo{
@@ -201,6 +216,193 @@ Renderer::Renderer(VulkanContext& ctx, platform::Window& window, const RendererD
         .queryCount = 2 * kFramesInFlight,
     };
     VK_CHECK(vkCreateQueryPool(device, &queryInfo, nullptr, &m_queryPool));
+
+    m_gpuCulling = desc.gpuCulling && m_ctx.drawIndirectCount();
+    if (desc.gpuCulling && !m_gpuCulling) {
+        std::fprintf(stderr, "GPU culling unavailable (no drawIndirectCount): culling on the CPU\n");
+    }
+    if (m_gpuCulling) {
+        createCulling();
+    }
+}
+
+void Renderer::createCulling()
+{
+    VkDevice device = m_ctx.device();
+    const VkDescriptorSetLayoutBinding bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, // chunk table
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, // draws
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, // counters
+    };
+    const VkDescriptorSetLayoutCreateInfo layoutInfo{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 3,
+        .pBindings = bindings,
+    };
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_cullSetLayout));
+
+    const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kFramesInFlight};
+    const VkDescriptorPoolCreateInfo poolInfo{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = kFramesInFlight,
+        .poolSizeCount = 1,
+        .pPoolSizes = &poolSize,
+    };
+    VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_cullPool));
+
+    const VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CullPushConstants)};
+    const VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &m_cullSetLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushRange,
+    };
+    VK_CHECK(vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &m_cullPipelineLayout));
+
+    VkShaderModule module = createShaderModule(device, kCullCompSpv);
+    const VkComputePipelineCreateInfo pipelineInfo{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                  .module = module,
+                  .pName = "main"},
+        .layout = m_cullPipelineLayout,
+    };
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_cullPipeline));
+    vkDestroyShaderModule(device, module, nullptr);
+
+    for (Frame& f : m_frames) {
+        f.gpuDraws =
+            createBuffer(m_ctx.allocator(), m_maxDraws * sizeof(VkDrawIndexedIndirectCommand),
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, MemoryKind::GpuOnly);
+        f.counters = createBuffer(m_ctx.allocator(), 4 * sizeof(u32),
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                  MemoryKind::GpuOnly);
+        f.countersReadback =
+            createBuffer(m_ctx.allocator(), 4 * sizeof(u32), VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemoryKind::Readback);
+
+        const VkDescriptorSetAllocateInfo setInfo{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = m_cullPool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &m_cullSetLayout,
+        };
+        VK_CHECK(vkAllocateDescriptorSets(device, &setInfo, &f.cullSet));
+        const VkDescriptorBufferInfo infos[] = {
+            {m_meshes->chunkTable(), 0, VK_WHOLE_SIZE},
+            {f.gpuDraws.buffer, 0, VK_WHOLE_SIZE},
+            {f.counters.buffer, 0, VK_WHOLE_SIZE},
+        };
+        VkWriteDescriptorSet writes[3];
+        for (u32 i = 0; i < 3; ++i) {
+            writes[i] = VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = f.cullSet,
+                .dstBinding = i,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &infos[i],
+            };
+        }
+        vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+    }
+}
+
+void Renderer::destroyCulling()
+{
+    VkDevice device = m_ctx.device();
+    for (Frame& f : m_frames) {
+        destroyBuffer(m_ctx.allocator(), f.gpuDraws);
+        destroyBuffer(m_ctx.allocator(), f.counters);
+        destroyBuffer(m_ctx.allocator(), f.countersReadback);
+    }
+    vkDestroyPipeline(device, m_cullPipeline, nullptr);
+    vkDestroyPipelineLayout(device, m_cullPipelineLayout, nullptr);
+    vkDestroyDescriptorPool(device, m_cullPool, nullptr);
+    vkDestroyDescriptorSetLayout(device, m_cullSetLayout, nullptr);
+}
+
+void Renderer::recordCulling(VkCommandBuffer cmd, Frame& frame, const Camera& camera) const
+{
+    ENGINE_PROFILE_FUNCTION();
+    // This frame slot's culling buffers were last used two frames ago and its
+    // fence has been waited on since, so nothing can overlap in practice. Say
+    // so to Vulkan anyway: order all earlier indirect reads, copies and
+    // compute writes before this frame's resets and writes. They all happen
+    // at the very start of earlier frames, so this costs nothing.
+    const VkMemoryBarrier2 reuse{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    const VkDependencyInfo reuseDep{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &reuse};
+    vkCmdPipelineBarrier2(cmd, &reuseDep);
+
+    // Reset the draw count and statistics.
+    vkCmdFillBuffer(cmd, frame.counters.buffer, 0, VK_WHOLE_SIZE, 0);
+    const VkMemoryBarrier2 cleared{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    const VkDependencyInfo clearDep{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &cleared};
+    vkCmdPipelineBarrier2(cmd, &clearDep);
+
+    const VkExtent2D extent = m_swapchain->extent();
+    const f32 aspect = static_cast<f32>(extent.width) / static_cast<f32>(extent.height);
+    const Frustum frustum = Frustum::fromViewProj(camera.projection(aspect) * camera.viewRotation());
+    const f32 maxDist = m_desc.fogDistance + 56.0f; // fully fogged beyond (as on the CPU path)
+    const u32 slots = m_meshes->slotCount();
+    CullPushConstants pc{
+        .cameraBlock = glm::ivec4{camera.cameraBlock(), 0},
+        .cameraFraction = glm::vec4{camera.cameraFraction(), maxDist * maxDist},
+        .planes = {},
+        .params = glm::uvec4{slots, m_desc.faceCulling ? 1u : 0u, m_maxDraws, 0u},
+    };
+    for (usize i = 0; i < 5; ++i) {
+        pc.planes[i] = frustum.planes[i];
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_cullPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_cullPipelineLayout, 0, 1, &frame.cullSet, 0,
+                            nullptr);
+    vkCmdPushConstants(cmd, m_cullPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    if (slots > 0) {
+        vkCmdDispatch(cmd, (slots + kCullGroupSize - 1) / kCullGroupSize, 1, 1);
+    }
+
+    // Draws and count are read by the indirect draw; the statistics copied out.
+    const VkMemoryBarrier2 culled{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+        .dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT,
+    };
+    const VkDependencyInfo culledDep{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &culled};
+    vkCmdPipelineBarrier2(cmd, &culledDep);
+
+    const VkBufferCopy region{.size = 4 * sizeof(u32)};
+    vkCmdCopyBuffer(cmd, frame.counters.buffer, frame.countersReadback.buffer, 1, &region);
+    const VkMemoryBarrier2 toHost{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+        .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+    };
+    const VkDependencyInfo hostDep{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &toHost};
+    vkCmdPipelineBarrier2(cmd, &hostDep);
 }
 
 Renderer::~Renderer()
@@ -219,6 +421,9 @@ Renderer::~Renderer()
     destroyTextures();
     destroyBuffer(m_ctx.allocator(), m_indexBuffer);
     destroyBuffer(m_ctx.allocator(), m_screenshotBuffer);
+    if (m_gpuCulling) {
+        destroyCulling();
+    }
     vkDestroyPipeline(device, m_pipeline, nullptr);
     vkDestroyPipelineLayout(device, m_pipelineLayout, nullptr);
     vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
@@ -559,7 +764,7 @@ u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& 
         if (glm::dot(d, d) > maxDistSq || !frustum.intersects(min, max)) {
             continue;
         }
-        ++stats.drawnChunks;
+        const u32 drawsBefore = count;
 
         // Face-direction culling: a face can only be seen from in front of
         // its plane. +X faces lie on planes from min.x + 1 to max.x, so none
@@ -595,6 +800,9 @@ u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& 
                 stats.drawnQuads += quads;
             }
             f = end;
+        }
+        if (count > drawsBefore) {
+            ++stats.drawnChunks; // counted like the GPU path: only chunks that produced a draw
         }
     }
     if (count > 0) {
@@ -664,7 +872,21 @@ FrameStats Renderer::renderFrame(const Camera& camera)
     }
     VK_CHECK(vkResetFences(device, 1, &frame.inFlight));
 
-    const u32 drawCount = cullAndWriteDraws(frame, camera, stats);
+    u32 drawCount = 0;
+    if (m_gpuCulling) {
+        // Statistics of this slot's previous frame (the GPU is done with it).
+        if (frame.countersWritten) {
+            VK_CHECK(vmaInvalidateAllocation(m_ctx.allocator(), frame.countersReadback.allocation, 0, VK_WHOLE_SIZE));
+            const auto* counters = static_cast<const u32*>(frame.countersReadback.mapped);
+            stats.draws = std::min(counters[0], m_maxDraws);
+            stats.drawnChunks = counters[1];
+            stats.drawnQuads = counters[2];
+        }
+        stats.gpuCulled = true;
+        drawCount = m_meshes->slotCount() > 0 ? m_maxDraws : 0; // the real count comes from the GPU
+    } else {
+        drawCount = cullAndWriteDraws(frame, camera, stats);
+    }
 
     const bool screenshot = !m_screenshotPath.empty();
     stats.uploadedBytes = recordFrame(frame, imageIndex, drawCount, camera, screenshot);
@@ -695,6 +917,7 @@ FrameStats Renderer::renderFrame(const Camera& camera)
     };
     VK_CHECK(vkQueueSubmit2(m_ctx.queue(), 1, &submit, frame.inFlight));
     frame.timestampsWritten = true;
+    frame.countersWritten = m_gpuCulling;
 
     if (screenshot) {
         VK_CHECK(vkWaitForFences(device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX));
@@ -739,6 +962,9 @@ VkDeviceSize Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, 
 
     // New chunk meshes, copied in before anything draws (outside the render pass).
     const VkDeviceSize uploaded = m_meshes->recordUploads(cmd, m_frameIndex);
+    if (m_gpuCulling) {
+        recordCulling(cmd, frame, camera); // also outside the render pass
+    }
 
     VkImage colorImage = m_swapchain->image(imageIndex);
     const VkExtent2D extent = m_swapchain->extent();
@@ -805,7 +1031,13 @@ VkDeviceSize Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, 
                            sizeof(pc), &pc);
         vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
         // The whole visible world in one call.
-        vkCmdDrawIndexedIndirect(cmd, frame.indirect.buffer, 0, drawCount, sizeof(VkDrawIndexedIndirectCommand));
+        if (m_gpuCulling) {
+            // As many draws as the culling shader produced (at most drawCount).
+            vkCmdDrawIndexedIndirectCount(cmd, frame.gpuDraws.buffer, 0, frame.counters.buffer, 0, drawCount,
+                                          sizeof(VkDrawIndexedIndirectCommand));
+        } else {
+            vkCmdDrawIndexedIndirect(cmd, frame.indirect.buffer, 0, drawCount, sizeof(VkDrawIndexedIndirectCommand));
+        }
     }
     vkCmdEndRendering(cmd);
 

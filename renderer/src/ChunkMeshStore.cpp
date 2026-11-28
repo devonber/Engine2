@@ -9,7 +9,7 @@ namespace engine::render {
 
 namespace {
 constexpr VkDeviceSize kQuadBytes = sizeof(voxel::PackedQuad);
-constexpr VkDeviceSize kOriginBytes = sizeof(glm::ivec4);
+constexpr VkDeviceSize kRecordBytes = sizeof(GpuChunk);
 // The densest possible chunk (3D checkerboard) must fit in one frame's upload.
 constexpr VkDeviceSize kMaxChunkMeshBytes = voxel::kChunkVolume / 2 * 6 * kQuadBytes;
 } // namespace
@@ -17,23 +17,27 @@ constexpr VkDeviceSize kMaxChunkMeshBytes = voxel::kChunkVolume / 2 * 6 * kQuadB
 ChunkMeshStore::ChunkMeshStore(VulkanContext& ctx, u64 quadCapacity, u32 maxChunks, u32 framesInFlight,
                                VkDeviceSize uploadBudgetPerFrame)
     : m_ctx(ctx), m_framesInFlight(framesInFlight),
-      m_uploadBudget(std::max(uploadBudgetPerFrame, kMaxChunkMeshBytes + kOriginBytes))
+      m_uploadBudget(std::max(uploadBudgetPerFrame, kMaxChunkMeshBytes + kRecordBytes))
 {
     VmaAllocator allocator = ctx.allocator();
     m_quads = createBuffer(allocator, quadCapacity * kQuadBytes,
                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT, // source when growing
                            MemoryKind::GpuOnly);
-    m_origins =
-        createBuffer(allocator, static_cast<VkDeviceSize>(maxChunks) * kOriginBytes,
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemoryKind::GpuOnly);
+    // Zero-filled at start, so every record reads "not drawable".
+    std::vector<GpuChunk> empty(maxChunks, GpuChunk{});
+    m_chunkTable = createBufferWithData(ctx, empty.data(), empty.size() * sizeof(GpuChunk),
+                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
     const VmaVirtualBlockCreateInfo blockInfo{.size = quadCapacity * kQuadBytes};
     VK_CHECK(vmaCreateVirtualBlock(&blockInfo, &m_quadBlock));
 
+    // Staging: the mesh-data budget, plus room for every slot's GPU record so
+    // records (tiny, but possibly many after a mass unload) always fit.
     m_staging.resize(framesInFlight);
     for (Buffer& b : m_staging) {
-        b = createBuffer(allocator, m_uploadBudget, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryKind::Upload);
+        b = createBuffer(allocator, m_uploadBudget + 16 + static_cast<VkDeviceSize>(maxChunks) * kRecordBytes,
+                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryKind::Upload);
     }
     m_slots.resize(maxChunks);
     m_deferred.resize(framesInFlight);
@@ -49,7 +53,7 @@ ChunkMeshStore::~ChunkMeshStore()
         destroyBuffer(allocator, b);
     }
     destroyBuffer(allocator, m_quads);
-    destroyBuffer(allocator, m_origins);
+    destroyBuffer(allocator, m_chunkTable);
 }
 
 bool ChunkMeshStore::set(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads)
@@ -158,6 +162,26 @@ void ChunkMeshStore::grow(u64 minQuads)
         });
     }
 
+    // Every chunk's first quad moved: rewrite the whole GPU chunk table now
+    // (the GPU is idle), so no frame ever draws with stale offsets.
+    {
+        std::vector<GpuChunk> table(m_slots.size(), GpuChunk{});
+        for (u32 i = 0; i < m_highWater; ++i) {
+            table[i] = gpuRecord(m_slots[i]);
+            m_slots[i].gpuDirty = false;
+        }
+        m_dirty.clear();
+        Buffer staging = createBuffer(m_ctx.allocator(), table.size() * sizeof(GpuChunk),
+                                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryKind::Upload);
+        std::memcpy(staging.mapped, table.data(), table.size() * sizeof(GpuChunk));
+        VK_CHECK(vmaFlushAllocation(m_ctx.allocator(), staging.allocation, 0, VK_WHOLE_SIZE));
+        m_ctx.immediateSubmit([&](VkCommandBuffer cmd) {
+            const VkBufferCopy region{.size = table.size() * sizeof(GpuChunk)};
+            vkCmdCopyBuffer(cmd, staging.buffer, m_chunkTable.buffer, 1, &region);
+        });
+        destroyBuffer(m_ctx.allocator(), staging);
+    }
+
     vmaClearVirtualBlock(m_quadBlock);
     vmaDestroyVirtualBlock(m_quadBlock);
     destroyBuffer(m_ctx.allocator(), m_quads);
@@ -183,6 +207,7 @@ void ChunkMeshStore::releaseSlot(u32 index)
     slot.used = false;
     slot.drawable = false;
     ++slot.generation; // a pending upload for this slot is now stale
+    markDirty(index);  // the GPU stops drawing it from the next frame on
 
     // Frames already recorded may still read this range and slot. The frame
     // slot that comes round again just before the next frame (k + N - 1) is
@@ -190,6 +215,25 @@ void ChunkMeshStore::releaseSlot(u32 index)
     const u32 when = (m_nextFrameSlot + m_framesInFlight - 1) % m_framesInFlight;
     m_deferred[when].push_back({index, slot.allocation});
     slot.allocation = VK_NULL_HANDLE;
+}
+
+void ChunkMeshStore::markDirty(u32 index)
+{
+    if (!m_slots[index].gpuDirty) {
+        m_slots[index].gpuDirty = true;
+        m_dirty.push_back(index);
+    }
+}
+
+GpuChunk ChunkMeshStore::gpuRecord(const Slot& slot) const noexcept
+{
+    const auto& f = slot.faceStart;
+    const u32 drawable = slot.used && slot.drawable && slot.quadCount > 0 ? 1u : 0u;
+    return GpuChunk{
+        .originFirst = glm::ivec4{slot.origin, static_cast<i32>(slot.firstQuad)},
+        .faces0 = glm::uvec4{f[0], f[1], f[2], f[3]},
+        .faces1 = glm::uvec4{f[4], f[5], f[6], drawable},
+    };
 }
 
 void ChunkMeshStore::beginFrame(u32 frameSlot)
@@ -210,8 +254,10 @@ VkDeviceSize ChunkMeshStore::recordUploads(VkCommandBuffer cmd, u32 frameSlot)
     auto* dst = static_cast<u8*>(staging.mapped);
     VkDeviceSize offset = 0;
     std::vector<VkBufferCopy> quadCopies;
-    std::vector<VkBufferCopy> originCopies;
+    std::vector<VkBufferCopy> recordCopies;
 
+    // Mesh data up to the budget; GPU records after it in their own reserved
+    // space, so a chunk's record is always written in the frame its quads are.
     while (!m_pending.empty()) {
         Pending& p = m_pending.front();
         const VkDeviceSize bytes = p.quads.size() * kQuadBytes;
@@ -221,37 +267,44 @@ VkDeviceSize ChunkMeshStore::recordUploads(VkCommandBuffer cmd, u32 frameSlot)
             m_pending.pop_front();
             continue;
         }
-        if (offset + bytes + kOriginBytes > m_uploadBudget) {
+        if (offset + bytes > m_uploadBudget) {
             break; // the rest goes next frame
         }
         std::memcpy(dst + offset, p.quads.data(), bytes);
         quadCopies.push_back({offset, slot.firstQuad * kQuadBytes, bytes});
         offset += bytes;
 
-        offset = (offset + kOriginBytes - 1) & ~(kOriginBytes - 1);
-        const glm::ivec4 origin{slot.origin, 0};
-        std::memcpy(dst + offset, &origin, kOriginBytes);
-        originCopies.push_back({offset, p.slot * kOriginBytes, kOriginBytes});
-        offset += kOriginBytes;
-
-        slot.drawable = true; // copied before this frame's draws (barrier below)
+        slot.drawable = true; // copied before this frame's culling and draws (barrier below)
+        markDirty(p.slot);
         m_pendingBytes -= bytes;
         m_pending.pop_front();
     }
 
-    if (quadCopies.empty()) {
+    // GPU chunk records: newly drawable and removed slots.
+    offset = (offset + 15) & ~VkDeviceSize{15};
+    for (const u32 index : m_dirty) {
+        Slot& slot = m_slots[index];
+        slot.gpuDirty = false;
+        const GpuChunk record = gpuRecord(slot);
+        std::memcpy(dst + offset, &record, kRecordBytes);
+        recordCopies.push_back({offset, index * kRecordBytes, kRecordBytes});
+        offset += kRecordBytes;
+    }
+    m_dirty.clear();
+
+    if (quadCopies.empty() && recordCopies.empty()) {
         return 0;
     }
     VK_CHECK(vmaFlushAllocation(m_ctx.allocator(), staging.allocation, 0, offset));
 
     // The ranges written here are not read by any frame still in flight (new
-    // allocations, or freed after their last reader finished). But draws bind
-    // the whole buffer, so in Vulkan's terms the previous frame's vertex shader
-    // reads all of it: order the copies after it (execution-only, no cache
-    // flushes). Only costs anything on frames that upload.
+    // allocations, or freed after their last reader finished). But culling
+    // and draws bind whole buffers, so in Vulkan's terms the previous frame's
+    // compute and vertex shaders read all of them: order the copies after
+    // those (execution-only, no cache flushes). Only on frames that upload.
     const VkMemoryBarrier2 afterReads{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-        .srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+        .srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
     };
     const VkDependencyInfo beforeCopy{
@@ -261,14 +314,19 @@ VkDeviceSize ChunkMeshStore::recordUploads(VkCommandBuffer cmd, u32 frameSlot)
     };
     vkCmdPipelineBarrier2(cmd, &beforeCopy);
 
-    vkCmdCopyBuffer(cmd, staging.buffer, m_quads.buffer, static_cast<u32>(quadCopies.size()), quadCopies.data());
-    vkCmdCopyBuffer(cmd, staging.buffer, m_origins.buffer, static_cast<u32>(originCopies.size()), originCopies.data());
+    if (!quadCopies.empty()) {
+        vkCmdCopyBuffer(cmd, staging.buffer, m_quads.buffer, static_cast<u32>(quadCopies.size()), quadCopies.data());
+    }
+    if (!recordCopies.empty()) {
+        vkCmdCopyBuffer(cmd, staging.buffer, m_chunkTable.buffer, static_cast<u32>(recordCopies.size()),
+                        recordCopies.data());
+    }
 
     const VkMemoryBarrier2 barrier{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
         .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
     };
     const VkDependencyInfo dep{

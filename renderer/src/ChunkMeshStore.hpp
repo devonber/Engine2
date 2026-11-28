@@ -17,13 +17,23 @@ namespace engine::render {
 // GPU storage for chunk meshes that come and go while the game runs.
 //
 // - One big quad buffer, divided up with a VMA virtual allocator; each chunk
-//   owns a range. One origins buffer indexed by chunk slot (firstInstance).
+//   owns a range. One chunk table on the GPU, indexed by chunk slot
+//   (firstInstance), with what the culling compute shader and the vertex
+//   shader need to know about each chunk (GpuChunk).
 // - New meshes are queued and copied in through a per-frame staging buffer at
 //   the start of a frame's command buffer, so a chunk becomes drawable in the
 //   frame its upload is recorded. A per-frame byte budget spreads bursts of
 //   new chunks over several frames instead of causing a hitch.
 // - A removed or replaced mesh's range and slot are freed only once every
 //   frame that could still read them has finished on the GPU.
+// One chunk's record in the GPU chunk table (std430: 48 bytes).
+struct GpuChunk {
+    glm::ivec4 originFirst; // xyz: world position of voxel (0,0,0); w: first quad in the quad buffer
+    glm::uvec4 faces0;      // faceStart[0..3]
+    glm::uvec4 faces1;      // xyz: faceStart[4..6] (= quad count); w: 1 if drawable
+};
+static_assert(sizeof(GpuChunk) == 48);
+
 class ChunkMeshStore {
 public:
     struct Slot {
@@ -37,6 +47,7 @@ public:
         std::array<u32, voxel::kFaceCount + 1> faceStart{};
         bool used = false;
         bool drawable = false; // upload recorded
+        bool gpuDirty = false; // GPU chunk record needs rewriting
         VmaVirtualAllocation allocation = VK_NULL_HANDLE;
     };
 
@@ -74,7 +85,9 @@ public:
     [[nodiscard]] std::span<const Slot> slots() const noexcept { return {m_slots.data(), m_highWater}; }
     [[nodiscard]] u32 maxChunks() const noexcept { return static_cast<u32>(m_slots.size()); }
     [[nodiscard]] VkBuffer quadBuffer() const noexcept { return m_quads.buffer; }
-    [[nodiscard]] VkBuffer originBuffer() const noexcept { return m_origins.buffer; }
+    [[nodiscard]] VkBuffer chunkTable() const noexcept { return m_chunkTable.buffer; }
+    // Slots [0, slotCount()) may be in use: the culling dispatch size.
+    [[nodiscard]] u32 slotCount() const noexcept { return m_highWater; }
     [[nodiscard]] Stats stats() const;
 
     // True once after the quad buffer was replaced by a bigger one: the
@@ -93,6 +106,8 @@ private:
     };
 
     void releaseSlot(u32 slot); // defer freeing until no in-flight frame uses it
+    void markDirty(u32 slot);
+    [[nodiscard]] GpuChunk gpuRecord(const Slot& slot) const noexcept;
     // Replaces the quad buffer with one of at least `minQuads` capacity and
     // re-packs every chunk's range into it. Waits for the GPU.
     void grow(u64 minQuads);
@@ -102,7 +117,7 @@ private:
     VkDeviceSize m_uploadBudget;
 
     Buffer m_quads;
-    Buffer m_origins;
+    Buffer m_chunkTable;
     VmaVirtualBlock m_quadBlock = VK_NULL_HANDLE;
     std::vector<Buffer> m_staging; // one per frame slot
 
@@ -112,6 +127,7 @@ private:
     std::unordered_map<u64, u32> m_slotOf;
 
     std::deque<Pending> m_pending;
+    std::vector<u32> m_dirty; // slots whose GPU record changes
     u64 m_pendingBytes = 0;
     std::vector<std::vector<Deferred>> m_deferred; // per frame slot
     u32 m_nextFrameSlot = 0;

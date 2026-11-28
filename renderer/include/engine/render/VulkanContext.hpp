@@ -35,6 +35,8 @@ public:
     [[nodiscard]] VmaAllocator allocator() const noexcept { return m_allocator; }
     [[nodiscard]] const VkPhysicalDeviceProperties& properties() const noexcept { return m_properties; }
     [[nodiscard]] bool samplerAnisotropy() const noexcept { return m_samplerAnisotropy; }
+    // vkCmdDrawIndexedIndirectCount (Vulkan 1.2 feature): GPU-driven culling.
+    [[nodiscard]] bool drawIndirectCount() const noexcept { return m_drawIndirectCount; }
 
     // Record and run commands synchronously. For uploads at load time only;
     // it stalls the GPU.
@@ -65,6 +67,7 @@ private:
     VmaAllocator m_allocator = nullptr;
     VkCommandPool m_immediatePool = VK_NULL_HANDLE;
     bool m_samplerAnisotropy = false;
+    bool m_drawIndirectCount = false;
 };
 
 // GPU buffer + its VMA allocation. `mapped` is non-null for host-visible buffers.
