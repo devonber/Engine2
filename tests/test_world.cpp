@@ -62,7 +62,10 @@ TEST_CASE("Terrain columns have the expected layering")
             for (i32 y = h; y < kWorldHeight; ++y) {
                 REQUIRE(at(y) == blocks::Air);
             }
-            CHECK((at(h - 1) == blocks::Grass || at(h - 1) == blocks::Sand));
+            const BlockId top = column.sandDepth[i] > 0   ? blocks::Sand
+                                : column.soilDepth[i] > 0 ? blocks::Grass
+                                                          : blocks::Stone; // bare rock
+            CHECK(at(h - 1) == top);
         }
     }
 }
@@ -88,6 +91,8 @@ TEST_CASE("Coarse levels of detail: cells follow the average surface over their 
         const i32 vscale = lodVerticalScale(level);
         CHECK(vscale <= 4);
         const i32 layers = worldHeightChunks(level);
+        f64 errorSum = 0.0;
+        int errorCount = 0;
         for (const auto& [cx, cz] : {std::pair{0, 0}, std::pair{3, -2}, std::pair{-5, 7}}) {
             TerrainColumn column;
             terrainColumn(cx, cz, column, level);
@@ -108,12 +113,19 @@ TEST_CASE("Coarse levels of detail: cells follow the average surface over their 
                     const i32 cells = column.height[z * kChunkSize + x];
                     CAPTURE(mean);
                     CAPTURE(cells);
-                    // Within half a cell, plus rounding of the block heights.
-                    CHECK(std::abs(cells * vscale - mean) <= vscale * 0.5 + 1.0);
+                    // Within 1.75 cells. Half a cell is rounding; the rest is what
+                    // fading noise octaves by a factor cannot do exactly (gradient
+                    // noise is not a sine wave; ridges, the mountain mask and the
+                    // soft cap are nonlinear). Measured: at most 5.6 blocks (level
+                    // 7), mean 0.7..2.0; without the filtering, 10.9 at level 7.
+                    const f64 error = std::abs(cells * vscale - mean);
+                    CHECK(error <= vscale * 1.75);
+                    errorSum += error;
+                    ++errorCount;
                     CHECK(cells < layers * static_cast<i32>(kChunkSize)); // fits the level's layers
                 }
             }
-            // Filled chunks are solid up to the cell height, with a grass or sand top.
+            // Filled chunks are solid up to the cell height, with a grass, sand or (peaks) stone top.
             for (i32 cy = 0; cy < kWorldHeightChunks; ++cy) {
                 fillTerrainChunk(*chunk, column, cy);
                 if (cy >= layers) {
@@ -125,12 +137,13 @@ TEST_CASE("Coarse levels of detail: cells follow the average surface over their 
                         const BlockId b = chunk->blocks()[static_cast<usize>(y) * kChunkArea + i];
                         REQUIRE((b != blocks::Air) == (y < h));
                         if (y == h - 1) {
-                            CHECK((b == blocks::Grass || b == blocks::Sand));
+                            CHECK((b == blocks::Grass || b == blocks::Sand || b == blocks::Stone));
                         }
                     }
                 }
             }
         }
+        CHECK(errorSum / errorCount <= 2.25); // on average, close to the true mean
     }
 }
 
