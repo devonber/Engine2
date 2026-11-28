@@ -2,10 +2,11 @@
 
 #include "engine/core/Profile.hpp"
 #include "engine/core/ThreadPool.hpp"
-#include "engine/voxel/Generate.hpp"
+#include "engine/voxel/Blocks.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <new>
 #include <utility>
 
@@ -15,7 +16,7 @@ namespace {
 
 constexpr std::align_val_t kChunkAlign{64};
 
-// Horizontal neighbours, in ChunkNeighbours face order.
+// Horizontal neighbours.
 constexpr std::pair<Face, std::pair<i32, i32>> kSideNeighbours[] = {
     {Face::PosX, {+1, 0}},
     {Face::NegX, {-1, 0}},
@@ -23,9 +24,44 @@ constexpr std::pair<Face, std::pair<i32, i32>> kSideNeighbours[] = {
     {Face::NegZ, {0, -1}},
 };
 
+// Shared read-only data for uniform stone chunks, so meshing one needs no
+// storage of its own.
+const Chunk& stoneChunk()
+{
+    static const Chunk chunk = [] {
+        Chunk c{Chunk::Uninitialized{}};
+        c.fill(blocks::Stone);
+        return c;
+    }();
+    return chunk;
+}
+
+OuterLayers uniformOuterLayers(ChunkContent content)
+{
+    OuterLayers out;
+    if (content == ChunkContent::Stone) {
+        for (auto& face : out.rows) {
+            face.fill(~0u);
+        }
+    }
+    return out; // air: all zero
+}
+
+bool allSolid(const BoundaryMasks& masks) noexcept
+{
+    for (const auto& face : masks.rows) {
+        for (const u32 row : face) {
+            if (row != ~0u) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
-ChunkCoord chunkAt(f32 worldX, f32 worldZ) noexcept
+ColumnCoord columnAt(f32 worldX, f32 worldZ) noexcept
 {
     constexpr f32 size = static_cast<f32>(kChunkSize);
     return {static_cast<i32>(std::floor(worldX / size)), static_cast<i32>(std::floor(worldZ / size))};
@@ -79,6 +115,7 @@ ChunkStreamer::ChunkStreamer(ThreadPool& pool, const StreamingOptions& options) 
         }
     }
     std::ranges::stable_sort(m_offsets, {}, [](const auto& o) { return o.first * o.first + o.second * o.second; });
+    static_cast<void>(stoneChunk()); // initialise now rather than inside the first mesh job
 }
 
 ChunkStreamer::~ChunkStreamer()
@@ -87,20 +124,20 @@ ChunkStreamer::~ChunkStreamer()
     m_jobsDone.wait(lock, [this] { return m_running == 0; });
 }
 
-ChunkStreamer::Entry* ChunkStreamer::find(ChunkCoord coord)
+ChunkStreamer::Column* ChunkStreamer::find(ColumnCoord coord)
 {
-    const auto it = m_entries.find(coord.key());
-    return it != m_entries.end() ? &it->second : nullptr;
+    const auto it = m_columns.find(coord.key());
+    return it != m_columns.end() ? &it->second : nullptr;
 }
 
-i64 ChunkStreamer::distanceSq(ChunkCoord coord) const noexcept
+i64 ChunkStreamer::distanceSq(ColumnCoord coord) const noexcept
 {
     const i64 dx = coord.x - m_center.x;
     const i64 dz = coord.z - m_center.z;
     return dx * dx + dz * dz;
 }
 
-void ChunkStreamer::update(ChunkCoord center)
+void ChunkStreamer::update(ColumnCoord center)
 {
     ENGINE_PROFILE_FUNCTION();
     const bool moved = !m_hasCenter || center != m_center;
@@ -113,7 +150,7 @@ void ChunkStreamer::update(ChunkCoord center)
 
     if (moved || completed) {
         m_settled = false;
-        unloadFar(); // completions release pins, which may unblock unloading
+        unloadFar(); // finished jobs may unblock unloading of their columns
     }
     if (!m_settled) {
         schedule();
@@ -127,7 +164,7 @@ std::vector<ChunkMeshEvent> ChunkStreamer::takeMeshEvents()
 
 ChunkStreamer::Stats ChunkStreamer::stats() const
 {
-    return {static_cast<u32>(m_entries.size()), m_meshed, m_inFlight, m_chunkPool.allocatedChunks()};
+    return {static_cast<u32>(m_columns.size()), m_stored, m_meshed, m_inFlight, m_chunkPool.allocatedChunks()};
 }
 
 void ChunkStreamer::collectCompletions()
@@ -145,27 +182,38 @@ void ChunkStreamer::collectCompletions()
 
 void ChunkStreamer::complete(Completion&& c)
 {
-    Entry* entry = find(c.coord);
-    ENGINE_ASSERT(entry != nullptr); // in-flight chunks are never unloaded
-    if (!c.isMesh) {
-        entry->state = State::Ready;
+    Column* column = find(c.column);
+    ENGINE_ASSERT(column != nullptr); // columns with jobs in flight are never unloaded
+
+    if (c.layer < 0) {
+        column->state = State::Ready;
+        for (usize i = 0; i < kLayers; ++i) {
+            ChunkState& cs = column->chunks[i];
+            cs.content = c.contents[i];
+            cs.outer = c.outer[i];
+            if (cs.content != ChunkContent::Mixed) {
+                m_chunkPool.release(cs.data); // uniform: no storage needed
+                cs.data = nullptr;
+            } else {
+                ++m_stored;
+            }
+        }
         return;
     }
 
-    entry->meshing = false;
-    --entry->pins;
-    for (const auto& [face, d] : kSideNeighbours) {
-        Entry* n = find({c.coord.x + d.first, c.coord.z + d.second});
-        ENGINE_ASSERT(n != nullptr && n->pins > 0);
-        --n->pins;
-    }
-
+    ChunkState& cs = column->chunks[static_cast<usize>(c.layer)];
+    cs.meshing = false;
     // The player may have moved on while this was meshing.
     const i64 keep = m_options.viewRadius + 1;
-    if (distanceSq(c.coord) <= keep * keep) {
-        entry->meshed = true;
+    if (distanceSq(c.column) > keep * keep) {
+        column->allMeshed = false;
+        return;
+    }
+    cs.meshed = true;
+    if (!c.quads.empty()) {
+        cs.hasMesh = true;
         ++m_meshed;
-        m_events.push_back({c.coord, std::move(c.quads), false});
+        m_events.push_back({{c.column.x, c.layer, c.column.z}, std::move(c.quads), false});
     }
 }
 
@@ -174,18 +222,33 @@ void ChunkStreamer::unloadFar()
     ENGINE_PROFILE_FUNCTION();
     const i64 unmesh = m_options.viewRadius + 1;
     const i64 unload = m_options.viewRadius + 2;
-    for (auto it = m_entries.begin(); it != m_entries.end();) {
-        const ChunkCoord coord{static_cast<i32>(it->first >> 32), static_cast<i32>(static_cast<u32>(it->first))};
-        Entry& e = it->second;
-        const i64 d2 = distanceSq(coord);
-        if (e.meshed && d2 > unmesh * unmesh) {
-            e.meshed = false;
-            --m_meshed;
-            m_events.push_back({coord, {}, true});
+    for (auto it = m_columns.begin(); it != m_columns.end();) {
+        Column& col = it->second;
+        const i64 d2 = distanceSq(col.coord);
+        if (d2 <= unmesh * unmesh) {
+            ++it;
+            continue;
         }
-        if (d2 > unload * unload && e.state == State::Ready && !e.meshing && e.pins == 0) {
-            m_chunkPool.release(e.chunk);
-            it = m_entries.erase(it);
+        bool meshing = false;
+        for (usize i = 0; i < kLayers; ++i) {
+            ChunkState& cs = col.chunks[i];
+            if (cs.hasMesh) {
+                cs.hasMesh = false;
+                --m_meshed;
+                m_events.push_back({{col.coord.x, static_cast<i32>(i), col.coord.z}, {}, true});
+            }
+            cs.meshed = false;
+            meshing |= cs.meshing;
+        }
+        col.allMeshed = false;
+        if (d2 > unload * unload && col.state == State::Ready && !meshing) {
+            for (ChunkState& cs : col.chunks) {
+                if (cs.data != nullptr) {
+                    m_chunkPool.release(cs.data);
+                    --m_stored;
+                }
+            }
+            it = m_columns.erase(it);
         } else {
             ++it;
         }
@@ -199,9 +262,9 @@ void ChunkStreamer::schedule()
     bool workLeft = false;
 
     for (const auto& [dx, dz] : m_offsets) {
-        const ChunkCoord coord{m_center.x + dx, m_center.z + dz};
-        Entry* e = find(coord);
-        if (e == nullptr) {
+        const ColumnCoord coord{m_center.x + dx, m_center.z + dz};
+        Column* col = find(coord);
+        if (col == nullptr) {
             workLeft = true;
             if (m_inFlight >= m_maxInFlight) {
                 break;
@@ -209,28 +272,36 @@ void ChunkStreamer::schedule()
             submitGenerate(coord);
             continue;
         }
-        if (e->state == State::Generating || e->meshing) {
+        if (col->state == State::Generating) {
             workLeft = true;
             continue;
         }
-        if (e->meshed || static_cast<i64>(dx) * dx + static_cast<i64>(dz) * dz > meshRadiusSq) {
+        if (col->allMeshed || static_cast<i64>(dx) * dx + static_cast<i64>(dz) * dz > meshRadiusSq) {
             continue; // done, or in the generate-only outer ring
         }
         bool neighboursReady = true;
         for (const auto& [face, d] : kSideNeighbours) {
-            const Entry* n = find({coord.x + d.first, coord.z + d.second});
+            const Column* n = find({coord.x + d.first, coord.z + d.second});
             neighboursReady &= n != nullptr && n->state == State::Ready;
         }
-        workLeft = true;
         if (!neighboursReady) {
-            continue; // they are nearer the edge: generated soon
+            workLeft = true; // they are nearer the edge: generated soon
+            continue;
         }
-        if (m_inFlight >= m_maxInFlight) {
+        const bool withinBudget = scheduleMeshes(*col);
+        workLeft |= !col->allMeshed;
+        if (!withinBudget) {
             break;
         }
-        submitMesh(coord, *e);
     }
     m_settled = !workLeft && m_inFlight == 0;
+}
+
+void ChunkStreamer::trackSubmit()
+{
+    ++m_inFlight;
+    std::lock_guard lock(m_completionMutex);
+    ++m_running;
 }
 
 void ChunkStreamer::finish(Completion&& completion)
@@ -241,51 +312,99 @@ void ChunkStreamer::finish(Completion&& completion)
     m_jobsDone.notify_all(); // under the lock: see the header
 }
 
-void ChunkStreamer::submitGenerate(ChunkCoord coord)
+void ChunkStreamer::submitGenerate(ColumnCoord coord)
 {
-    Chunk* chunk = m_chunkPool.acquire();
-    m_entries.emplace(coord.key(), Entry{.chunk = chunk});
-    ++m_inFlight;
-    {
-        std::lock_guard lock(m_completionMutex);
-        ++m_running;
+    // Storage for every layer up front (the pool is main-thread only); the
+    // layers that turn out uniform are returned on completion.
+    std::array<Chunk*, kLayers> storage;
+    Column col{.coord = coord};
+    for (usize i = 0; i < kLayers; ++i) {
+        storage[i] = m_chunkPool.acquire();
+        col.chunks[i].data = storage[i];
     }
-    m_pool.submit([this, coord, chunk] {
-        ENGINE_PROFILE_SCOPE("generate chunk");
-        fillTerrain(*chunk, coord.x, coord.z); // writes every voxel
-        finish({coord, false, {}});
+    m_columns.emplace(coord.key(), col);
+    trackSubmit();
+
+    m_pool.submit([this, coord, storage] {
+        ENGINE_PROFILE_SCOPE("generate column");
+        TerrainColumn terrain;
+        terrainColumn(coord.x, coord.z, terrain); // one heightmap for every layer
+        Completion done{.column = coord, .layer = -1};
+        for (usize i = 0; i < kLayers; ++i) {
+            const i32 layer = static_cast<i32>(i);
+            done.contents[i] = classifyTerrainChunk(terrain, layer);
+            if (done.contents[i] == ChunkContent::Mixed) {
+                fillTerrainChunk(*storage[i], terrain, layer); // writes every voxel
+                // While the chunk is in this core's cache: record its outer
+                // layers, which is all its neighbours' meshing needs from it.
+                done.outer[i] = computeOuterLayers(*storage[i]);
+            } else {
+                done.outer[i] = uniformOuterLayers(done.contents[i]);
+            }
+        }
+        finish(std::move(done));
     });
 }
 
-void ChunkStreamer::submitMesh(ChunkCoord coord, Entry& entry)
+bool ChunkStreamer::scheduleMeshes(Column& col)
 {
-    entry.meshing = true;
-    ++entry.pins;
-    ChunkNeighbours nb;
-    for (const auto& [face, d] : kSideNeighbours) {
-        Entry* n = find({coord.x + d.first, coord.z + d.second});
-        ++n->pins; // must not be unloaded while the job reads it
-        nb.chunks[static_cast<usize>(face)] = n->chunk;
+    std::array<const Column*, 4> side{};
+    for (usize s = 0; s < 4; ++s) {
+        const auto [dx, dz] = kSideNeighbours[s].second;
+        side[s] = find({col.coord.x + dx, col.coord.z + dz});
     }
-    ++m_inFlight;
-    {
-        std::lock_guard lock(m_completionMutex);
-        ++m_running;
-    }
-    m_pool.submit([this, coord, chunk = entry.chunk, nb, greedy = m_options.greedy] {
-        ENGINE_PROFILE_SCOPE("mesh chunk");
-        BoundaryMasks masks = buildBoundaryMasks(nb);
-        masks.setSolid(Face::NegY); // nothing is ever seen below the world
-        // Mesh into a per-thread scratch buffer (capacity reused), then copy
-        // out with one exact-size allocation.
-        thread_local std::vector<PackedQuad> scratch;
-        if (greedy) {
-            meshChunkGreedy(*chunk, masks, scratch);
-        } else {
-            meshChunkBinary(*chunk, masks, scratch);
+
+    bool budgetLeft = true;
+    for (usize i = 0; i < kLayers; ++i) {
+        ChunkState& cs = col.chunks[i];
+        if (cs.meshed || cs.meshing) {
+            continue;
         }
-        finish({coord, true, std::vector<PackedQuad>(scratch.begin(), scratch.end())});
-    });
+        if (cs.content == ChunkContent::Air) {
+            cs.meshed = true; // nothing to draw
+            continue;
+        }
+
+        // Boundary masks from the neighbours' outer layers, built here so the
+        // job never touches neighbour chunk memory.
+        std::array<const OuterLayers*, kFaceCount> nb{};
+        for (usize s = 0; s < 4; ++s) {
+            nb[static_cast<usize>(kSideNeighbours[s].first)] = &side[s]->chunks[i].outer;
+        }
+        nb[static_cast<usize>(Face::PosY)] = i + 1 < kLayers ? &col.chunks[i + 1].outer : nullptr; // top: air
+        nb[static_cast<usize>(Face::NegY)] = i > 0 ? &col.chunks[i - 1].outer : nullptr;
+        BoundaryMasks masks = boundaryFromNeighbours(nb);
+        if (i == 0) {
+            masks.setSolid(Face::NegY); // nothing is ever seen below the world
+        }
+        if (cs.content == ChunkContent::Stone && allSolid(masks)) {
+            cs.meshed = true; // buried: no visible faces
+            continue;
+        }
+
+        if (m_inFlight >= m_maxInFlight) {
+            budgetLeft = false;
+            break;
+        }
+        cs.meshing = true; // keeps the column loaded while the job reads the chunk
+        trackSubmit();
+        const Chunk* chunk = cs.data != nullptr ? cs.data : &stoneChunk();
+        m_pool.submit([this, coord = col.coord, layer = static_cast<i32>(i), chunk, masks, greedy = m_options.greedy] {
+            ENGINE_PROFILE_SCOPE("mesh chunk");
+            // Mesh into a per-thread scratch buffer (capacity reused), then
+            // copy out with one exact-size allocation.
+            thread_local std::vector<PackedQuad> scratch;
+            if (greedy) {
+                meshChunkGreedy(*chunk, masks, scratch);
+            } else {
+                meshChunkBinary(*chunk, masks, scratch);
+            }
+            finish({.column = coord, .layer = layer, .quads = std::vector<PackedQuad>(scratch.begin(), scratch.end())});
+        });
+    }
+
+    col.allMeshed = std::ranges::all_of(col.chunks, [](const ChunkState& cs) { return cs.meshed; });
+    return budgetLeft;
 }
 
 } // namespace engine::voxel

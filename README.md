@@ -72,10 +72,13 @@ Vulkan 1.3, written for throughput:
 - **Meshing** (`engine/voxel/Mesher.hpp`): visible faces are found 32 voxels at a time with bit operations,
   faces between neighbouring chunks are culled, and adjacent faces of the same block are merged into
   rectangles (greedy meshing). On the sandbox world that cuts 2.87M quads to 0.62M (4.6x).
-- **Streaming** (`engine/voxel/ChunkStreamer.hpp`): chunks around the camera are generated and meshed by
-  background jobs on a thread pool (`engine/core/ThreadPool.hpp`), nearest first, and unloaded behind it.
-  Chunk memory is pooled and reused. The renderer keeps all chunk meshes in one GPU buffer, divided up by
-  a VMA virtual allocator, and uploads new meshes within a per-frame byte budget.
+- **Streaming** (`engine/voxel/ChunkStreamer.hpp`): the world is columns of 4 chunks (128 blocks tall).
+  Columns around the camera are generated and their chunks meshed by background jobs on a thread pool
+  (`engine/core/ThreadPool.hpp`), nearest first, and unloaded behind it. Chunks that are all air or all
+  stone take no memory, and air chunks or buried stone chunks need no meshing. A chunk records its outer
+  layers as bitmasks when generated, so meshing its neighbours never reads its (cold) memory. Chunk memory
+  is pooled and reused. The renderer keeps all chunk meshes in one GPU buffer, divided up by a VMA virtual
+  allocator, and uploads new meshes within a per-frame byte budget.
 - **Explicit AVX2** in the hot loops (voxel bitmasks, terrain layers, face masks), with plain C++
   fallbacks, so speed does not depend on what a compiler's auto-vectoriser happens to do.
 - **One draw call for the whole world**: chunks are frustum-culled on the CPU, which writes one

@@ -332,6 +332,48 @@ BoundaryMasks buildBoundaryMasks(const ChunkNeighbours& neighbours)
     return masks;
 }
 
+OuterLayers computeOuterLayers(const Chunk& chunk)
+{
+    ENGINE_PROFILE_FUNCTION();
+    OuterLayers out;
+    auto& r = out.rows;
+    const BlockId* blocks = chunk.blocks().data();
+    constexpr u32 last = kChunkSize - 1;
+    for (u32 y = 0; y < kChunkSize; ++y) {
+        u32 xLow = 0;  // x = 0 layer, row y: bit z
+        u32 xHigh = 0; // x = 31 layer
+        for (u32 z = 0; z < kChunkSize; ++z) {
+            const u32 m = solidMask32(blocks + voxelIndex(0, y, z)); // bit x
+            xLow |= (m & 1u) << z;
+            xHigh |= (m >> last) << z;
+            if (y == 0) {
+                r[static_cast<usize>(Face::NegY)][z] = m; // rows z, bits x
+            } else if (y == last) {
+                r[static_cast<usize>(Face::PosY)][z] = m;
+            }
+            if (z == 0) {
+                r[static_cast<usize>(Face::NegZ)][y] = m; // rows y, bits x
+            } else if (z == last) {
+                r[static_cast<usize>(Face::PosZ)][y] = m;
+            }
+        }
+        r[static_cast<usize>(Face::NegX)][y] = xLow; // rows y, bits z
+        r[static_cast<usize>(Face::PosX)][y] = xHigh;
+    }
+    return out;
+}
+
+BoundaryMasks boundaryFromNeighbours(const std::array<const OuterLayers*, kFaceCount>& neighbours) noexcept
+{
+    BoundaryMasks masks;
+    for (u32 f = 0; f < kFaceCount; ++f) {
+        if (neighbours[f] != nullptr) {
+            masks.rows[f] = neighbours[f]->rows[f ^ 1u];
+        }
+    }
+    return masks;
+}
+
 void meshChunkNaive(const Chunk& chunk, const ChunkNeighbours& neighbours, std::vector<PackedQuad>& out)
 {
     ENGINE_PROFILE_FUNCTION();

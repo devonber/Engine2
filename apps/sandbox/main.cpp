@@ -50,7 +50,7 @@ struct Options {
     bool greedy = true;
     u32 threads = 0; // 0 = all hardware threads
     f32 fly = 0.0f;
-    f32 camera[5] = {0.0f, 45.0f, 40.0f, 0.0f, -20.0f};
+    f32 camera[5] = {0.0f, 90.0f, 40.0f, 0.0f, -20.0f};
 };
 
 Options parseArgs(int argc, char** argv)
@@ -186,14 +186,14 @@ int main(int argc, char** argv)
 
         // Streaming: schedule work around the camera, hand finished meshes to the GPU.
         const auto streamStart = Clock::now();
-        const voxel::ChunkCoord centre = voxel::chunkAt(camera.position.x, camera.position.z);
+        const voxel::ColumnCoord centre = voxel::columnAt(camera.position.x, camera.position.z);
         streamer.update(centre);
         for (voxel::ChunkMeshEvent& e : streamer.takeMeshEvents()) {
             if (e.removed) {
                 renderer.removeChunkMesh(e.coord.key());
             } else {
                 constexpr i32 n = static_cast<i32>(voxel::kChunkSize);
-                renderer.setChunkMesh(e.coord.key(), {e.coord.x * n, 0, e.coord.z * n}, std::move(e.quads));
+                renderer.setChunkMesh(e.coord.key(), {e.coord.x * n, e.coord.y * n, e.coord.z * n}, std::move(e.quads));
             }
         }
         streamAccumMs += std::chrono::duration<f64, std::milli>(Clock::now() - streamStart).count();
@@ -202,10 +202,12 @@ int main(int argc, char** argv)
             loaded = true;
             const voxel::ChunkStreamer::Stats ss = streamer.stats();
             const render::MeshMemoryStats ms = renderer.meshStats();
-            std::fprintf(
-                stderr, "Initial area loaded in %.1f ms: %u chunks generated, %u meshed, %.2fM quads (%.1f MiB)\n",
-                std::chrono::duration<f64, std::milli>(Clock::now() - start).count(), ss.loadedChunks, ss.meshedChunks,
-                static_cast<f64>(ms.quads) / 1e6, static_cast<f64>(ms.usedBytes) / (1024.0 * 1024.0));
+            std::fprintf(stderr,
+                         "Initial area loaded in %.1f ms: %u columns (%u chunks stored), %u chunk meshes, %.2fM quads "
+                         "(%.1f MiB)\n",
+                         std::chrono::duration<f64, std::milli>(Clock::now() - start).count(), ss.loadedColumns,
+                         ss.storedChunks, ss.meshedChunks, static_cast<f64>(ms.quads) / 1e6,
+                         static_cast<f64>(ms.usedBytes) / (1024.0 * 1024.0));
         }
         if (loaded && framesAfterLoad == screenshotFrame) {
             renderer.requestScreenshot(opt.screenshot);

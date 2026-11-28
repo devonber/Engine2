@@ -24,10 +24,10 @@ void runMesherBenchmarks()
     for (auto& c : side) {
         c = std::make_unique<Chunk>();
     }
-    fillTerrain(*side[0], 1, 0);
-    fillTerrain(*side[1], -1, 0);
-    fillTerrain(*side[2], 0, 1);
-    fillTerrain(*side[3], 0, -1);
+    fillTerrain(*side[0], 1, 1, 0);
+    fillTerrain(*side[1], -1, 1, 0);
+    fillTerrain(*side[2], 0, 1, 1);
+    fillTerrain(*side[3], 0, 1, -1);
     ChunkNeighbours terrainNeighbours;
     terrainNeighbours.chunks[static_cast<usize>(Face::PosX)] = side[0].get();
     terrainNeighbours.chunks[static_cast<usize>(Face::NegX)] = side[1].get();
@@ -59,7 +59,7 @@ void runMesherBenchmarks()
         });
     };
 
-    fillTerrain(*chunk, 0, 0);
+    fillTerrain(*chunk, 0, 1, 0);
     bench("mesh: terrain, with neighbours", terrainNeighbours);
 
     fillRandom(*chunk, 0.5, 42);
