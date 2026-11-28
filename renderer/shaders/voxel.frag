@@ -14,11 +14,23 @@ layout(location = 1) in float inDistance;
 layout(location = 2) flat in uint inLayer;
 layout(location = 3) flat in float inShade;
 layout(location = 4) in float inOcclusion; // interpolated across the quad
+layout(location = 5) in vec2 inHorizontal;
+layout(location = 6) flat in float inSeamRadius;
+
+// True only in the pipeline used for coarse chunks that cross a level-of-detail
+// seam: closer to the camera than the seam, the finer level is drawn instead.
+// The test is per pixel and depends only on the horizontal distance from the
+// camera, which only grows along a view ray, so every ray sees the fine level
+// up to the seam and the coarse one after it.
+layout(constant_id = 0) const bool kLodDiscard = false;
 
 layout(location = 0) out vec4 outColor;
 
 void main()
 {
+    if (kLodDiscard && dot(inHorizontal, inHorizontal) < inSeamRadius * inSeamRadius) {
+        discard;
+    }
     // inUV runs 0..width / 0..height across a greedy-merged quad: one texture
     // tile per block. Wrap it per block ourselves and sample with CLAMP_TO_EDGE
     // rather than relying on REPEAT: with REPEAT, filtering near a block's

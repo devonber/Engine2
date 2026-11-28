@@ -10,7 +10,7 @@ layout(local_size_x = 64) in;
 struct GpuChunk {
     ivec4 originFirst; // xyz: world position of voxel (0,0,0); w: first quad
     uvec4 faces0;      // faceStart[0..3]
-    uvec4 faces1;      // xyz: faceStart[4..6]; w: 1 if drawable
+    uvec4 faces1;      // xyz: faceStart[4..6]; w: bit 0 drawable, bits 1+: level of detail
 };
 
 struct DrawCommand { // VkDrawIndexedIndirectCommand
@@ -27,14 +27,14 @@ layout(std430, set = 0, binding = 2) buffer Counters {
     uint drawCount; // read by vkCmdDrawIndexedIndirectCount
     uint chunkCount;
     uint quadCount;
-    uint unused;
+    uint seamDrawCount; // read by the seam draw (draws[maxDraws + i])
 };
 
 layout(push_constant) uniform PushConstants {
     ivec4 cameraBlock;    // xyz: integer block containing the camera
-    vec4 cameraFraction;  // xyz: camera position within it; w: squared culling distance
+    vec4 cameraFraction;  // xyz: camera position within it; w: fog distance
     vec4 planes[5];       // camera-relative frustum (left, right, bottom, top, near)
-    uvec4 params;         // x: slot count, y: face culling on, z: draw buffer capacity
+    uvec4 params;         // x: slot count, y: face culling on, z: capacity of each draw list, w: LOD seam (float bits)
 } pc;
 
 void main()
@@ -44,15 +44,18 @@ void main()
         return;
     }
     const GpuChunk c = chunks[slot];
-    if (c.faces1.w == 0u) {
+    if ((c.faces1.w & 1u) == 0u) {
         return; // empty, removed, or not uploaded yet
     }
+    const uint level = c.faces1.w >> 1;
+    const float scale = float(1u << level);
 
     // Chunk box relative to the camera (integer part exact).
     const vec3 lo = vec3(c.originFirst.xyz - pc.cameraBlock.xyz) - pc.cameraFraction.xyz;
-    const vec3 hi = lo + 32.0;
+    const vec3 hi = lo + 32.0 * scale;
     const vec3 centre = (lo + hi) * 0.5;
-    if (dot(centre, centre) > pc.cameraFraction.w) {
+    const float maxDist = pc.cameraFraction.w + 56.0 * scale;
+    if (dot(centre, centre) > maxDist * maxDist) {
         return; // fully fogged
     }
     for (int i = 0; i < 5; ++i) {
@@ -62,6 +65,20 @@ void main()
         if (dot(p.xyz, v) + p.w < 0.0) {
             return;
         }
+    }
+
+    // Levels of detail: skip chunks entirely inside their seam (the finer
+    // level covers that); chunks crossing it go to the seam list, drawn with
+    // the pipeline that discards the covered fragments.
+    bool seam = false;
+    const float inner = level == 0u ? 0.0 : uintBitsToFloat(pc.params.w) * float(1u << (level - 1u));
+    if (inner > 0.0) {
+        const vec2 nearest = vec2(max(max(lo.x, -hi.x), 0.0), max(max(lo.z, -hi.z), 0.0));
+        const vec2 farthest = vec2(max(-lo.x, hi.x), max(-lo.z, hi.z));
+        if (dot(farthest, farthest) <= inner * inner) {
+            return;
+        }
+        seam = dot(nearest, nearest) < inner * inner;
     }
 
     // Face directions that can face the camera (camera at the origin).
@@ -99,12 +116,14 @@ void main()
         return;
     }
 
-    const uint base = atomicAdd(drawCount, runs);
+    const uint base = seam ? atomicAdd(seamDrawCount, runs) : atomicAdd(drawCount, runs);
+    const uint list = seam ? pc.params.z : 0u;
     atomicAdd(chunkCount, 1u);
     atomicAdd(quadCount, quads);
     for (uint r = 0u; r < runs; ++r) {
         if (base + r < pc.params.z) { // the draw count is also clamped when drawing
-            draws[base + r] = DrawCommand(runQuads[r] * 6u, 1u, 0u, int((uint(c.originFirst.w) + runFirst[r]) * 4u), slot);
+            draws[list + base + r] =
+                DrawCommand(runQuads[r] * 6u, 1u, 0u, int((uint(c.originFirst.w) + runFirst[r]) * 4u), slot);
         }
     }
 }

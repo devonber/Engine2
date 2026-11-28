@@ -4,6 +4,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -65,33 +66,84 @@ TEST_CASE("Terrain columns have the expected layering")
     }
 }
 
-TEST_CASE("Uniform chunk classification matches the filled chunk")
+TEST_CASE("Coarse levels of detail: cells are solid where the surface covers at least half of them")
 {
     auto chunk = std::make_unique<Chunk>();
-    int air = 0, stone = 0, mixed = 0;
-    for (i32 cx = -40; cx <= 40; cx += 8) {
-        for (i32 cz = -40; cz <= 40; cz += 8) {
+    for (u32 level = 1; level <= 4; ++level) {
+        CAPTURE(level);
+        const i32 scale = lodScale(level);
+        const i32 layers = worldHeightChunks(level);
+        for (const auto& [cx, cz] : {std::pair{0, 0}, std::pair{3, -2}, std::pair{-5, 7}}) {
             TerrainColumn column;
-            terrainColumn(cx, cz, column);
+            terrainColumn(cx, cz, column, level);
+            for (u32 z = 0; z < kChunkSize; z += 5) {
+                for (u32 x = 0; x < kChunkSize; x += 3) {
+                    // The full-resolution height at the cell's centre block.
+                    const i32 bx = (cx * static_cast<i32>(kChunkSize) + static_cast<i32>(x)) * scale + scale / 2;
+                    const i32 bz = (cz * static_cast<i32>(kChunkSize) + static_cast<i32>(z)) * scale + scale / 2;
+                    const auto floorDiv = [](i32 a, i32 b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
+                    TerrainColumn fine;
+                    terrainColumn(floorDiv(bx, 32), floorDiv(bz, 32), fine);
+                    const i32 blocks = fine.height[static_cast<usize>((bz - floorDiv(bz, 32) * 32) * 32 +
+                                                                      (bx - floorDiv(bx, 32) * 32))];
+                    const i32 cells = column.height[z * kChunkSize + x];
+                    CAPTURE(blocks);
+                    CAPTURE(cells);
+                    // Rounded to the nearest cell (at least one: the world has a floor).
+                    CHECK(cells == std::max(1, (blocks + scale / 2) >> level));
+                    CHECK((cells == 1 || std::abs(cells * scale - blocks) <= scale / 2));
+                    CHECK(cells < layers * static_cast<i32>(kChunkSize)); // fits the level's layers
+                }
+            }
+            // Filled chunks are solid up to the cell height, with a grass or sand top.
             for (i32 cy = 0; cy < kWorldHeightChunks; ++cy) {
                 fillTerrainChunk(*chunk, column, cy);
-                const auto blocks = chunk->blocks();
-                switch (classifyTerrainChunk(column, cy)) {
-                case ChunkContent::Air:
-                    ++air;
-                    REQUIRE(std::ranges::all_of(blocks, [](BlockId b) { return b == blocks::Air; }));
-                    break;
-                case ChunkContent::Stone:
-                    ++stone;
-                    REQUIRE(std::ranges::all_of(blocks, [](BlockId b) { return b == blocks::Stone; }));
-                    break;
-                case ChunkContent::Mixed:
-                    ++mixed;
-                    break;
+                if (cy >= layers) {
+                    CHECK(classifyTerrainChunk(column, cy) == ChunkContent::Air);
+                }
+                for (u32 i = 0; i < kChunkArea; i += 7) {
+                    const i32 h = column.height[i] - cy * static_cast<i32>(kChunkSize);
+                    for (i32 y = 0; y < static_cast<i32>(kChunkSize); ++y) {
+                        const BlockId b = chunk->blocks()[static_cast<usize>(y) * kChunkArea + i];
+                        REQUIRE((b != blocks::Air) == (y < h));
+                        if (y == h - 1) {
+                            CHECK((b == blocks::Grass || b == blocks::Sand));
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+TEST_CASE("Uniform chunk classification matches the filled chunk")
+{
+    auto chunk = std::make_unique<Chunk>();
+    int air = 0, stone = 0, mixed = 0;
+    for (u32 level : {0u, 1u, 2u})
+        for (i32 cx = -40; cx <= 40; cx += 8) {
+            for (i32 cz = -40; cz <= 40; cz += 8) {
+                TerrainColumn column;
+                terrainColumn(cx, cz, column, level);
+                for (i32 cy = 0; cy < kWorldHeightChunks; ++cy) {
+                    fillTerrainChunk(*chunk, column, cy);
+                    const auto blocks = chunk->blocks();
+                    switch (classifyTerrainChunk(column, cy)) {
+                    case ChunkContent::Air:
+                        ++air;
+                        REQUIRE(std::ranges::all_of(blocks, [](BlockId b) { return b == blocks::Air; }));
+                        break;
+                    case ChunkContent::Stone:
+                        ++stone;
+                        REQUIRE(std::ranges::all_of(blocks, [](BlockId b) { return b == blocks::Stone; }));
+                        break;
+                    case ChunkContent::Mixed:
+                        ++mixed;
+                        break;
+                    }
+                }
+            }
+        }
     // The terrain spans several layers, so all three kinds occur.
     CHECK(air > 0);
     CHECK(stone > 0);

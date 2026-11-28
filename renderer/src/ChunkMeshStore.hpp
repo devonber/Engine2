@@ -28,9 +28,9 @@ namespace engine::render {
 //   frame that could still read them has finished on the GPU.
 // One chunk's record in the GPU chunk table (std430: 48 bytes).
 struct GpuChunk {
-    glm::ivec4 originFirst; // xyz: world position of voxel (0,0,0); w: first quad in the quad buffer
+    glm::ivec4 originFirst; // xyz: world position (blocks) of voxel (0,0,0); w: first quad in the quad buffer
     glm::uvec4 faces0;      // faceStart[0..3]
-    glm::uvec4 faces1;      // xyz: faceStart[4..6] (= quad count); w: 1 if drawable
+    glm::uvec4 faces1;      // xyz: faceStart[4..6] (= quad count); w: bit 0 drawable, bits 1+: level of detail
 };
 static_assert(sizeof(GpuChunk) == 48);
 
@@ -41,6 +41,7 @@ public:
         u32 firstQuad = 0;
         u32 quadCount = 0;
         u32 generation = 0; // bumped on every set(); cancels stale pending uploads
+        u32 level = 0;      // level of detail: voxels are 2^level blocks
         // Quads are stored grouped by face direction (voxel::Face order):
         // direction f is quads [faceStart[f], faceStart[f + 1]) of this mesh,
         // so draws can skip directions that face away from the camera.
@@ -70,7 +71,7 @@ public:
     // Add or replace a chunk's mesh. Grows the quad buffer when it is full
     // (stalls the GPU once). False only if every chunk slot is in use.
     // Call between frames.
-    bool set(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads);
+    bool set(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads, u32 level = 0);
     void remove(u64 key);
 
     // Frame protocol, called by the renderer:

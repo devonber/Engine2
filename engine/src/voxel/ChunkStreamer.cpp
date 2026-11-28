@@ -53,9 +53,9 @@ bool allSolid(const BoundaryMasks& masks) noexcept
 
 } // namespace
 
-ColumnCoord columnAt(f64 worldX, f64 worldZ) noexcept
+ColumnCoord columnAt(f64 worldX, f64 worldZ, u32 level) noexcept
 {
-    constexpr f64 size = static_cast<f64>(kChunkSize);
+    const f64 size = static_cast<f64>(kChunkSize) * static_cast<f64>(lodScale(level));
     return {static_cast<i32>(std::floor(worldX / size)), static_cast<i32>(std::floor(worldZ / size))};
 }
 
@@ -92,6 +92,7 @@ void ChunkPool::release(Chunk* chunk) noexcept
 ChunkStreamer::ChunkStreamer(ThreadPool& pool, const StreamingOptions& options) : m_pool(pool), m_options(options)
 {
     m_options.viewRadius = std::max(m_options.viewRadius, 1);
+    ENGINE_ASSERT(m_options.level < kMaxLodLevels);
     // The queue is only refilled once per frame, so it must hold enough work
     // to keep every thread busy for a whole frame (a job is ~10-50 us).
     // Queued jobs are nearest-first; stale ones after a teleport cost little.
@@ -236,7 +237,7 @@ void ChunkStreamer::complete(Completion&& c)
     if (!c.quads.empty()) {
         cs.hasMesh = true;
         ++m_meshed;
-        m_events.push_back({{c.column.x, c.layer, c.column.z}, std::move(c.quads), false});
+        m_events.push_back({{c.column.x, c.layer, c.column.z}, m_options.level, std::move(c.quads), false});
     } else {
         recycle(std::move(c.quads));
     }
@@ -260,7 +261,7 @@ void ChunkStreamer::unloadFar()
             if (cs.hasMesh) {
                 cs.hasMesh = false;
                 --m_meshed;
-                m_events.push_back({{col.coord.x, static_cast<i32>(i), col.coord.z}, {}, true});
+                m_events.push_back({{col.coord.x, static_cast<i32>(i), col.coord.z}, m_options.level, {}, true});
             }
             cs.meshed = false;
             meshing |= cs.meshing;
@@ -363,10 +364,12 @@ void ChunkStreamer::submitGenerate(ColumnCoord coord)
     m_columns.emplace(coord.key(), std::move(col));
     trackSubmit();
 
-    m_batch.emplace_back([this, coord, storage, out] {
+    m_batch.emplace_back([this, coord, storage, out, level = m_options.level] {
         ENGINE_PROFILE_SCOPE("generate column");
         TerrainColumn terrain;
-        terrainColumn(coord.x, coord.z, terrain); // one heightmap for every layer
+        terrainColumn(coord.x, coord.z, terrain, level); // one heightmap for every layer
+        // Coarse levels have fewer layers of cells; the layers above them
+        // classify as air.
         for (usize i = 0; i < kLayers; ++i) {
             const i32 layer = static_cast<i32>(i);
             out->contents[i] = classifyTerrainChunk(terrain, layer);

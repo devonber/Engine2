@@ -13,9 +13,9 @@ layout(std430, set = 0, binding = 0) readonly buffer QuadBuffer { uvec2 quads[];
 // Per chunk slot (see GpuChunk in renderer/src/ChunkMeshStore.hpp); only the
 // origin is needed here.
 struct GpuChunk {
-    ivec4 originFirst; // xyz: world position of voxel (0,0,0)
+    ivec4 originFirst; // xyz: world position (blocks) of voxel (0,0,0)
     uvec4 faces0;
-    uvec4 faces1;
+    uvec4 faces1; // w: bit 0 drawable, bits 1+: level of detail (voxels are 2^level blocks)
 };
 layout(std430, set = 0, binding = 1) readonly buffer ChunkTable { GpuChunk chunks[]; };
 layout(std430, set = 0, binding = 3) readonly buffer FaceLayerBuffer { uint faceLayers[]; }; // [block * 6 + face]
@@ -23,7 +23,7 @@ layout(std430, set = 0, binding = 3) readonly buffer FaceLayerBuffer { uint face
 layout(push_constant) uniform PushConstants {
     mat4 viewProj;       // projection * rotation: the camera sits at the origin
     ivec4 cameraBlock;   // xyz: integer block containing the camera
-    vec4 cameraFraction; // xyz: camera position within that block
+    vec4 cameraFraction; // xyz: camera position within that block; w: LOD seam radius of level 1 (0: none)
     vec4 fog;            // rgb = colour (linear), a = distance of full fog
 } pc;
 
@@ -32,6 +32,8 @@ layout(location = 1) out float outDistance;
 layout(location = 2) flat out uint outLayer;
 layout(location = 3) flat out float outShade;
 layout(location = 4) out float outOcclusion;
+layout(location = 5) out vec2 outHorizontal;       // camera-relative x, z
+layout(location = 6) flat out float outSeamRadius; // discard closer than this, horizontally (seam pipeline)
 
 // Per face (PosX, NegX, PosY, NegY, PosZ, NegZ): base corner, U axis, V axis.
 // Must match kFaceAxes in engine/voxel/Mesher.hpp (width runs along U, height along V).
@@ -91,11 +93,23 @@ void main()
 
     // Camera-relative: the integer part is exact, so precision does not
     // depend on how far from the world origin the camera is.
-    const ivec3 voxel = chunks[gl_InstanceIndex].originFirst.xyz + ivec3(local) - pc.cameraBlock.xyz;
+    // At level of detail L a voxel is a 2^L block cube; its texture is
+    // stretched over it (one tile per voxel).
+    const GpuChunk chunk = chunks[gl_InstanceIndex];
+    const uint level = chunk.faces1.w >> 1;
+    const ivec3 voxel = chunk.originFirst.xyz + (ivec3(local) << level) - pc.cameraBlock.xyz;
     const vec2 corner2 = vec2(float(corner & 1u), float(corner >> 1));
     const vec3 inBlock = kBase[face] + kU[face] * (corner2.x * size.x) + kV[face] * (corner2.y * size.y);
-    const vec3 pos = vec3(voxel) - pc.cameraFraction.xyz + inBlock; // relative to the camera
+    const vec3 pos = vec3(voxel) - pc.cameraFraction.xyz + inBlock * float(1u << level); // relative to the camera
     gl_Position = pc.viewProj * vec4(pos, 1.0);
+    if (level > 0u) {
+        // Where a coarse level overlaps the finer one (just beyond a seam),
+        // coinciding surfaces must not z-fight: push coarser levels very
+        // slightly further away (reversed Z: depth = z / w, smaller is further).
+        gl_Position.z *= 1.0 - 2e-5 * float(level);
+    }
+    outHorizontal = pos.xz;
+    outSeamRadius = level == 0u ? 0.0 : pc.cameraFraction.w * float(1u << (level - 1u));
 
     outUV = faceUV(face, inBlock);
     outLayer = faceLayers[block * 6u + face];

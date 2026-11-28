@@ -92,6 +92,13 @@ Vulkan 1.3, written for throughput:
   the draw commands; one `vkCmdDrawIndexedIndirectCount` draws them, so the CPU never walks the chunk list.
   Falls back to CPU culling (`--cpu-culling`) on GPUs without draw-indirect-count. Both paths produce
   pixel-identical images.
+- **Levels of detail** for distant terrain: level L is the same world with voxels of 2^L blocks, so a
+  level-L chunk covers 2^L times the distance with the same 32^3 cells, mesher, ambient occlusion and
+  culling. Each level streams `--radius` of its own chunks around the camera (`--lod-levels`, default 4:
+  radius 12 reaches ~2,900 blocks). Level L takes over from level L-1 at a horizontal seam radius, tested
+  per pixel (horizontal distance only grows along a view ray, so there are no gaps); the finer level is
+  drawn a little past the seam with a tiny depth offset in its favour. Only coarse chunks that cross a
+  seam use the discarding pipeline; chunks entirely inside the seam are culled.
 - **Explicit AVX2** in the hot loops (voxel bitmasks, terrain layers, face masks), with plain C++
   fallbacks, so speed does not depend on what a compiler's auto-vectoriser happens to do.
 - **One draw call for the whole world**: every visible chunk's draws are indirect commands in one buffer.
@@ -107,11 +114,13 @@ Vulkan 1.3, written for throughput:
 Sandbox controls: left-click to capture the mouse, Esc to release; WASD to move, Space/Shift for
 up/down, Ctrl for speed. Frame rate, CPU and GPU times are shown in the title bar.
 
-Sandbox options: `--radius N` (view radius in chunks), `--vsync`, `--validation` / `--no-validation`,
+Sandbox options: `--radius N` (view radius in chunks, per level of detail), `--lod-levels N` (1 = full
+detail only), `--vsync`, `--validation` / `--no-validation`,
 `--camera x,y,z,yawDeg,pitchDeg`, `--assets DIR`, `--mesher greedy|binary`, `--no-ao`, `--no-face-culling`, `--cpu-culling`, `--mesh-memory MiB`, `--threads N`,
 `--fly SPEED` (fly forward automatically, blocks/s), `--frames N` (quit N frames after the initial area
-has loaded), `--screenshot file.bmp`. The title bar shows frame, CPU, GPU and streaming times, chunks
-drawn and meshed, background jobs, upload rate and mesh memory.
+has loaded), `--screenshot file.bmp`. The title bar shows frame, CPU (excluding time blocked on the
+GPU, shown as `wait`), GPU and streaming times, chunks and draws (`seam`: coarse chunks crossing a seam),
+chunks meshed, background jobs, upload rate and mesh memory.
 
 Validation is on by default in Debug builds. For deeper checks, set these environment variables
 (in Visual Studio: right-click `sandbox.exe` → *Add Debug Configuration* → `"env"`):

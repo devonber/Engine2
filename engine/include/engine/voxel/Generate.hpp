@@ -13,30 +13,49 @@ namespace engine::voxel {
 inline constexpr i32 kWorldHeightChunks = 4; // 128 blocks
 inline constexpr i32 kWorldHeight = kWorldHeightChunks * static_cast<i32>(kChunkSize);
 
-// Heightmap of one 32x32 column of chunks: everything a chunk layer of the
-// column needs, computed once and shared by all of them.
+// Level of detail: at level L every voxel ("cell") stands for a cube of
+// 2^L x 2^L x 2^L blocks, so a level-L chunk covers (32 * 2^L)^3 blocks with
+// the same 32^3 cells. Level 0 is the full-resolution world.
+inline constexpr u32 kMaxLodLevels = 8;
+[[nodiscard]] constexpr i32 lodScale(u32 level) noexcept
+{
+    return 1 << level;
+}
+// Chunk layers per column at a level (at least one; the top may be part air).
+[[nodiscard]] constexpr i32 worldHeightChunks(u32 level) noexcept
+{
+    return (kWorldHeightChunks >> level) > 0 ? (kWorldHeightChunks >> level) : 1;
+}
+
+// Heightmap of one 32x32 column of chunks at a level: everything a chunk
+// layer of the column needs, computed once and shared by all of them.
+// Heights and depths are in cells (blocks at level 0).
 struct TerrainColumn {
-    std::array<i16, kChunkArea> height;    // world y of the top solid block + 1, [x + z * 32]
-    std::array<i16, kChunkArea> sandDepth; // 3 in lowland (sand), 0 elsewhere
+    std::array<i16, kChunkArea> height;    // top solid cell + 1, [x + z * 32]
+    std::array<i16, kChunkArea> sandDepth; // surface cells that are sand (lowland), else 0
     i32 minHeight = 0;
     i32 maxHeight = 0;
+    i32 dirtDepth = 4; // cells of dirt (incl. the surface cell) above stone
+    u32 level = 0;
 };
 
 // Large rolling mountains and valleys with small hills on top; sand in low
-// ground, grass over dirt over stone elsewhere.
-void terrainColumn(i32 chunkX, i32 chunkZ, TerrainColumn& out);
+// ground, grass over dirt over stone elsewhere. At level L the heightmap is
+// sampled at cell centres and a cell is solid when the surface covers at
+// least half of it.
+void terrainColumn(i32 chunkX, i32 chunkZ, TerrainColumn& out, u32 level = 0);
 
 // Many chunks are a single block type; they need no storage and little or
 // no meshing. Decided from the heightmap alone, before filling anything.
 enum class ChunkContent : u8 { Mixed, Air, Stone };
 [[nodiscard]] ChunkContent classifyTerrainChunk(const TerrainColumn& column, i32 chunkY) noexcept;
 
-// Fills chunk layer `chunkY` of a column. Writes every voxel, so `chunk` may
-// be constructed with Chunk::Uninitialized.
+// Fills chunk layer `chunkY` of a column (at the column's level). Writes
+// every voxel, so `chunk` may be constructed with Chunk::Uninitialized.
 void fillTerrainChunk(Chunk& chunk, const TerrainColumn& column, i32 chunkY);
 
 // Convenience: terrainColumn + fillTerrainChunk.
-void fillTerrain(Chunk& chunk, i32 chunkX, i32 chunkY, i32 chunkZ);
+void fillTerrain(Chunk& chunk, i32 chunkX, i32 chunkY, i32 chunkZ, u32 level = 0);
 
 // Each voxel is solid with probability `density`. Writes every voxel.
 // density = 0.5 is the worst case for face count.

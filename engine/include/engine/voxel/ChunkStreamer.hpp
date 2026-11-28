@@ -34,18 +34,19 @@ struct ChunkCoord {
 
     constexpr auto operator<=>(const ChunkCoord&) const = default;
 
-    // Unique 64-bit key (x, z within +-2^23 chunks, y within +-2^15), e.g.
-    // for hash maps and the renderer.
-    [[nodiscard]] constexpr u64 key() const noexcept
+    // Unique 64-bit key of the chunk at a level of detail (x, z within
+    // +-2^23 chunks, y within +-2^7), e.g. for hash maps and the renderer.
+    [[nodiscard]] constexpr u64 key(u32 level = 0) const noexcept
     {
-        return ((static_cast<u64>(static_cast<u32>(x)) & 0xFFFFFFu) << 40) |
-               ((static_cast<u64>(static_cast<u32>(y)) & 0xFFFFu) << 24) |
+        return ((static_cast<u64>(static_cast<u32>(x)) & 0xFFFFFFu) << 40) | (static_cast<u64>(level & 0xFFu) << 32) |
+               ((static_cast<u64>(static_cast<u32>(y)) & 0xFFu) << 24) |
                (static_cast<u64>(static_cast<u32>(z)) & 0xFFFFFFu);
     }
 };
 
-// Column containing a world-space position (floor division, so -0.5 is column -1).
-[[nodiscard]] ColumnCoord columnAt(f64 worldX, f64 worldZ) noexcept;
+// Column containing a world-space position (floor division, so -0.5 is
+// column -1), in columns of the given level of detail (32 << level blocks wide).
+[[nodiscard]] ColumnCoord columnAt(f64 worldX, f64 worldZ, u32 level = 0) noexcept;
 
 // Recycles chunk storage. Chunks are 64 KiB; fresh allocations page-fault on
 // first touch, which is slow (and serialised per process on Windows), so
@@ -72,7 +73,8 @@ private:
 };
 
 struct StreamingOptions {
-    i32 viewRadius = 12; // columns within this distance (in chunks) get meshed
+    i32 viewRadius = 12; // columns within this distance (in chunks of this level) get meshed
+    u32 level = 0;       // level of detail: cells of 2^level blocks (see Generate.hpp)
     bool greedy = true;  // greedy meshing (else one quad per block face)
     bool ambientOcclusion = true;
     u32 maxJobsInFlight = 0; // 0 = 32 per pool thread (enough to last a frame)
@@ -81,14 +83,16 @@ struct StreamingOptions {
 // A change for the renderer. `removed` = drop the chunk's mesh. Only chunks
 // with at least one visible face get a mesh (and so an event).
 struct ChunkMeshEvent {
-    ChunkCoord coord;
+    ChunkCoord coord; // in chunks of the streamer's level
+    u32 level = 0;
     std::vector<PackedQuad> quads;
     bool removed = false;
 };
 
 // Keeps the columns of chunks around a moving centre generated and meshed,
 // using background jobs on a ThreadPool, and unloads columns that fall behind.
-// Distances are horizontal, in chunks:
+// Distances are horizontal, in chunks (of the streamer's level of detail:
+// one streamer per level, each with its own centre and chunk coordinates):
 //
 //   generate:  columns within viewRadius + 2 (so every meshed chunk has all 8 neighbouring columns)
 //   mesh:      chunks in columns within viewRadius, once the 8 surrounding columns exist
@@ -128,6 +132,7 @@ public:
 
     // True when everything around the last centre is generated and meshed.
     [[nodiscard]] bool settled() const noexcept { return m_settled; }
+    [[nodiscard]] u32 level() const noexcept { return m_options.level; }
 
 private:
     static constexpr usize kLayers = static_cast<usize>(kWorldHeightChunks);
