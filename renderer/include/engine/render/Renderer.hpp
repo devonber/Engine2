@@ -57,6 +57,7 @@ struct FrameStats {
     f64 waitMs = 0.0;       // CPU time blocked waiting for the GPU (frame slot fence, swapchain image)
     u32 seamDraws = 0;      // of `draws`: coarse-level draws crossing a seam (need the discard pipeline)
     u32 shadowDraws = 0;    // draws into the shadow cascades (not included in `draws`)
+    u32 shadowMaps = 0;     // shadow cascades re-rendered this frame (the others were cached)
     bool gpuCulled = false; // counts above come from the GPU, a couple of frames late
     u64 uploadedBytes = 0;  // mesh data copied to the GPU this frame
 };
@@ -84,7 +85,8 @@ public:
 
     // Add or replace the mesh of the chunk identified by `key`; `origin` is the
     // world position (in blocks) of its voxel (0,0,0). At level of detail L
-    // each voxel is 2^L blocks wide (a chunk covers 32 * 2^L blocks). The quads are copied. Uploaded in the background
+    // each voxel is 2^L blocks wide and 2^min(L, 2) tall (voxel::lodScale,
+    // voxel::lodVerticalScale). The quads are copied. Uploaded in the background
     // over the next frames (see RendererDesc::uploadBudgetBytes). False if there is no room. Call between frames.
     bool setChunkMesh(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads, u32 level = 0);
     void removeChunkMesh(u64 key);
@@ -134,8 +136,15 @@ private:
         glm::vec4 texelSize{0.0f};                                // world size of a shadow texel, per cascade
         u32 faceMask = 0; // face directions that face the light (bit per voxel::Face): the casters drawn
         f32 distance = 0.0f;
+        std::array<glm::dmat4, kCascades> world{}; // world position -> light clip space
+        std::array<bool, kCascades> render{};      // re-rendered this frame (else the cached map is used)
     };
     [[nodiscard]] Cascades computeCascades(const Camera& camera) const;
+    // Shadow maps are cached: a cascade is re-rendered only when its light
+    // matrix (snapped to texels) or the full-detail meshes change, and the
+    // two far cascades at most one per frame. Sets `render` and, for cached
+    // cascades, the matrices they were rendered with.
+    void scheduleShadowUpdates(Cascades& cascades, const Camera& camera);
 
     void createPipeline();
     void createShadows();
@@ -197,6 +206,15 @@ private:
     Buffer m_lightingBuffer;                                 // kFramesInFlight x m_lightingStride
     VkDeviceSize m_lightingStride = 0;
     u32 m_shadowCap = 0; // draws per shadow cascade list
+    struct CachedCascade {
+        bool valid = false;
+        glm::dmat4 world{1.0};
+        u64 meshVersion = 0;
+        u64 renderedFrame = 0;
+    };
+    std::array<CachedCascade, kCascades> m_shadowCache{};
+    glm::vec3 m_shadowLight{0.0f}; // light direction of the cached maps (moves in steps)
+    u64 m_frameCounter = 0;
 
     Buffer m_indexBuffer; // shared quad index pattern, sized for the densest possible chunk
     std::unique_ptr<ChunkMeshStore> m_meshes;

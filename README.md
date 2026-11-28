@@ -106,6 +106,9 @@ Vulkan 1.3, written for throughput:
   (4 x 2048^2, 16-bit, up to 256 blocks; bounding-sphere cascades snapped to whole texels so shadows
   neither change size when turning nor crawl when moving; normal-offset lookups and 4-tap hardware PCF).
   Shadow casters are culled per cascade by the same compute shader (faces towards the light only).
+  Cascades are cached: one is re-rendered only when its (snapped) light matrix or the full-detail
+  meshes change, the far two at most one per frame, and the shadow light direction follows the sun in
+  0.1-degree steps, so a still camera costs nothing extra and a moving one re-renders a few maps.
   The sky, fog and clear colour follow the sun. `--time H`, `--day-length S`, hold T to advance time,
   `--no-shadows`.
 - **No pinholes**: greedy-merged quads meet at T-junctions, where rasterisation can leave single pixels

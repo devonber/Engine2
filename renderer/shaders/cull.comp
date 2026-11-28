@@ -12,6 +12,8 @@
 
 layout(local_size_x = 64) in;
 
+const uint kMaxVerticalLevel = 2u; // engine/voxel/Generate.hpp: kMaxVerticalLodLevel
+
 struct GpuChunk {
     ivec4 originFirst; // xyz: world position of voxel (0,0,0); w: first quad
     uvec4 faces0;      // faceStart[0..3]
@@ -55,7 +57,8 @@ void main()
         return; // empty, removed, or not uploaded yet
     }
     const uint level = c.faces1.w >> 1;
-    const float scale = float(1u << level);
+    const float scale = float(1u << level);                         // horizontal
+    const float vscale = float(1u << min(level, kMaxVerticalLevel)); // vertical (cells at most 4 blocks tall)
     const uint pass = uint(pc.cameraBlock.w);
     if (pass != 0u && level != 0u) {
         return; // only full-detail chunks cast shadows
@@ -63,7 +66,7 @@ void main()
 
     // Chunk box relative to the camera (integer part exact).
     const vec3 lo = vec3(c.originFirst.xyz - pc.cameraBlock.xyz) - pc.cameraFraction.xyz;
-    const vec3 hi = lo + 32.0 * scale;
+    const vec3 hi = lo + 32.0 * vec3(scale, vscale, scale);
     const vec3 centre = (lo + hi) * 0.5;
     const float maxDist = pc.cameraFraction.w + 56.0 * scale;
     if (pass == 0u && dot(centre, centre) > maxDist * maxDist) {

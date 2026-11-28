@@ -3,6 +3,7 @@
 #include "engine/core/Profile.hpp"
 #include "engine/platform/Window.hpp"
 #include "engine/render/Camera.hpp"
+#include "engine/voxel/Generate.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -420,6 +421,9 @@ void Renderer::recordCulling(VkCommandBuffer cmd, Frame& frame, const Camera& ca
     // full-detail chunks in the cascade's box, faces towards the light.
     if (cascades.enabled && slots > 0) {
         for (u32 c = 0; c < kCascades; ++c) {
+            if (!cascades.render[c]) {
+                continue; // cached
+            }
             CullPushConstants sp{
                 .cameraBlock = glm::ivec4{camera.cameraBlock(), static_cast<i32>(1 + c)},
                 .cameraFraction = glm::vec4{camera.cameraFraction(), 0.0f},
@@ -808,7 +812,9 @@ Renderer::Cascades Renderer::computeCascades(const Camera& camera) const
     if (m_desc.lodSeam > 0.0f) {
         distance = std::min(distance, m_desc.lodSeam); // only full-detail chunks cast shadows
     }
-    const glm::vec3 light = glm::normalize(m_sky.lightDirection);
+    // The cached maps' light direction: follows the sun in small steps (see
+    // scheduleShadowUpdates), so a moving sun does not re-render every frame.
+    const glm::vec3 light = glm::normalize(m_shadowLight);
     // No shadows without a light worth shadowing (deep twilight) or one at
     // the horizon (shadows would stretch to infinity).
     if (!m_desc.shadows || distance <= 1.0f || light.y < 0.05f || glm::dot(m_sky.lightColor, glm::vec3{1.0f}) < 0.02f) {
@@ -859,14 +865,17 @@ Renderer::Cascades Renderer::computeCascades(const Camera& camera) const
         const f64 texel = 2.0 * static_cast<f64>(radius) / static_cast<f64>(size);
         out.texelSize[static_cast<glm::length_t>(c)] = static_cast<f32>(texel);
 
-        // Snap the centre to whole texels along the light's axes, in world
-        // space (double precision): moving the camera then shifts the shadow
-        // map by whole texels, so shadow edges do not crawl.
+        // Snap the centre to whole texels across the light, in world space
+        // (double precision): moving the camera then shifts the shadow map by
+        // whole texels, so shadow edges do not crawl. Along the light it is
+        // snapped to 8 blocks (the depth range has room), so the matrix only
+        // changes now and then: until it does, the cached map stays valid.
         const glm::dvec3 world = camera.position + glm::dvec3{centre};
         glm::dvec3 snapped = world;
         const f64 ax = std::floor(glm::dot(world, lx) / texel) * texel;
         const f64 ay = std::floor(glm::dot(world, ly) / texel) * texel;
-        snapped += lx * (ax - glm::dot(world, lx)) + ly * (ay - glm::dot(world, ly));
+        const f64 az = std::floor(glm::dot(world, l) / 8.0) * 8.0;
+        snapped += lx * (ax - glm::dot(world, lx)) + ly * (ay - glm::dot(world, ly)) + l * (az - glm::dot(world, l));
 
         // Light looks along -l from beyond the sphere; casters up to the top
         // of the world (and a margin) in front of it are included.
@@ -874,9 +883,10 @@ Renderer::Cascades Renderer::computeCascades(const Camera& camera) const
         const glm::dvec3 eye = snapped + l * back;
         const glm::dmat4 view = glm::lookAtRH(eye, snapped, ly);
         const f64 r = static_cast<f64>(radius);
-        const glm::dmat4 proj = glm::orthoRH_ZO(-r, r, -r, r, 0.0, back + r);
+        const glm::dmat4 proj = glm::orthoRH_ZO(-r, r, -r, r, 0.0, back + r + 16.0); // + the depth snapping
+        out.world[c] = proj * view;
         // Camera-relative: p_world = p_relative + camera position.
-        const glm::dmat4 relative = proj * view * glm::translate(glm::dmat4{1.0}, camera.position);
+        const glm::dmat4 relative = out.world[c] * glm::translate(glm::dmat4{1.0}, camera.position);
         const glm::mat4 m{relative};
         out.viewProj[c] = m;
 
@@ -894,6 +904,36 @@ Renderer::Cascades Renderer::computeCascades(const Camera& camera) const
     out.faceMask = (light.x > 0.0f ? 1u : 0u) | (light.x < 0.0f ? 2u : 0u) | (light.y > 0.0f ? 4u : 0u) |
                    (light.y < 0.0f ? 8u : 0u) | (light.z > 0.0f ? 16u : 0u) | (light.z < 0.0f ? 32u : 0u);
     return out;
+}
+
+void Renderer::scheduleShadowUpdates(Cascades& cascades, const Camera& camera)
+{
+    ++m_frameCounter;
+    if (!cascades.enabled) {
+        for (CachedCascade& cached : m_shadowCache) {
+            cached.valid = false; // nothing rendered: start afresh when shadows return
+        }
+        return;
+    }
+    const u64 version = m_meshes->fullDetailVersion();
+    bool farRendered = false;
+    // Far cascades: the one waiting longest goes first.
+    const u32 order[kCascades] = {0, 1, m_shadowCache[2].renderedFrame <= m_shadowCache[3].renderedFrame ? 2u : 3u,
+                                  m_shadowCache[2].renderedFrame <= m_shadowCache[3].renderedFrame ? 3u : 2u};
+    for (const u32 c : order) {
+        CachedCascade& cached = m_shadowCache[c];
+        const bool dirty = !cached.valid || cached.world != cascades.world[c] || cached.meshVersion != version;
+        const bool far = c >= 2;
+        if (dirty && (!cached.valid || !far || !farRendered)) {
+            cascades.render[c] = true;
+            farRendered |= far;
+            cached = {true, cascades.world[c], version, m_frameCounter};
+        } else {
+            // Use the cached map, with the matrix it was rendered with.
+            cascades.render[c] = false;
+            cascades.viewProj[c] = glm::mat4{cached.world * glm::translate(glm::dmat4{1.0}, camera.position)};
+        }
+    }
 }
 
 void Renderer::writeLighting(u32 frameSlot, const Camera& camera, const Cascades& cascades) const
@@ -1143,9 +1183,10 @@ Renderer::DrawCounts Renderer::cullAndWriteDraws(Frame& frame, const Camera& cam
         if (!c.drawable || c.quadCount == 0) {
             continue;
         }
-        const f32 size = static_cast<f32>(voxel::kChunkSize << c.level);
+        const f32 width = static_cast<f32>(voxel::kChunkSize) * static_cast<f32>(voxel::lodScale(c.level));
+        const f32 height = static_cast<f32>(voxel::kChunkSize) * static_cast<f32>(voxel::lodVerticalScale(c.level));
         const glm::vec3 min = glm::vec3{c.origin - camBlock} - camFrac; // chunk box, camera at 0
-        const glm::vec3 max = min + size;
+        const glm::vec3 max = min + glm::vec3{width, height, width};
 
         // Shadow casters: full-detail chunks in each cascade's box, faces
         // towards the light (the same tests as cull.comp).
@@ -1155,7 +1196,7 @@ Renderer::DrawCounts Renderer::cullAndWriteDraws(Frame& frame, const Camera& cam
                 lit[f] = ((cascades.faceMask >> f) & 1u) != 0;
             }
             for (u32 k = 0; k < kCascades; ++k) {
-                if (Frustum{cascades.planes[k]}.intersects(min, max)) {
+                if (cascades.render[k] && Frustum{cascades.planes[k]}.intersects(min, max)) {
                     appendRuns(c, i, lit, cmds + shadowListOffset(k), counts.shadow[k], m_shadowCap);
                 }
             }
@@ -1278,7 +1319,15 @@ FrameStats Renderer::renderFrame(const Camera& camera)
     }
     VK_CHECK(vkResetFences(device, 1, &frame.inFlight));
 
-    const Cascades cascades = computeCascades(camera);
+    // The shadow maps' light direction follows the sun in steps of 0.1 degrees:
+    // a moving sun re-renders them a few times a second, not every frame.
+    if (glm::dot(m_shadowLight, m_shadowLight) == 0.0f ||
+        glm::dot(glm::normalize(m_shadowLight), glm::normalize(m_sky.lightDirection)) < std::cos(glm::radians(0.1f))) {
+        m_shadowLight = glm::normalize(m_sky.lightDirection);
+    }
+    Cascades cascades = computeCascades(camera);
+    scheduleShadowUpdates(cascades, camera);
+    stats.shadowMaps = static_cast<u32>(std::ranges::count(cascades.render, true));
     writeLighting(m_frameIndex, camera, cascades); // this slot's previous frame is done with it
 
     DrawCounts drawCounts;
@@ -1300,7 +1349,9 @@ FrameStats Renderer::renderFrame(const Camera& camera)
         const bool any = m_meshes->slotCount() > 0;
         drawCounts.interior = any ? m_maxDraws : 0;
         drawCounts.seam = any && m_desc.lodSeam > 0.0f ? m_maxDraws : 0;
-        drawCounts.shadow.fill(any && cascades.enabled ? m_shadowCap : 0);
+        for (u32 c = 0; c < kCascades; ++c) {
+            drawCounts.shadow[c] = any && cascades.render[c] ? m_shadowCap : 0;
+        }
     } else {
         drawCounts = cullAndWriteDraws(frame, camera, cascades, stats);
     }
@@ -1380,6 +1431,9 @@ void Renderer::recordShadows(VkCommandBuffer cmd, const Frame& frame, const Casc
     constexpr u32 kStride = sizeof(VkDrawIndexedIndirectCommand);
     const u32 lightingOffset = static_cast<u32>(m_frameIndex * m_lightingStride);
     for (u32 c = 0; c < kCascades; ++c) {
+        if (!cascades.render[c]) {
+            continue; // cached
+        }
         const VkRenderingAttachmentInfo depthAttachment{
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = m_shadowLayerViews[c],
@@ -1450,7 +1504,8 @@ VkDeviceSize Renderer::recordFrame(Frame& frame, u32 imageIndex, const DrawCount
     if (m_gpuCulling) {
         recordCulling(cmd, frame, camera, cascades); // also outside the render pass
     }
-    if (cascades.enabled && m_textureImage != VK_NULL_HANDLE) {
+    if (cascades.enabled && m_textureImage != VK_NULL_HANDLE &&
+        std::ranges::any_of(cascades.render, [](bool r) { return r; })) {
         recordShadows(cmd, frame, cascades, camera, draws.shadow);
     }
 

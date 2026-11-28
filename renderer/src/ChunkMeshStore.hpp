@@ -90,6 +90,9 @@ public:
     // Slots [0, slotCount()) may be in use: the culling dispatch size.
     [[nodiscard]] u32 slotCount() const noexcept { return m_highWater; }
     [[nodiscard]] Stats stats() const;
+    // Changes whenever a full-detail (level 0) chunk becomes drawable or is
+    // removed: what shadow casters are. Cached shadow maps compare it.
+    [[nodiscard]] u64 fullDetailVersion() const noexcept { return m_fullDetailVersion; }
 
     // True once after the quad buffer was replaced by a bigger one: the
     // renderer must point its descriptor at quadBuffer() again.
@@ -138,6 +141,7 @@ private:
     u32 m_failed = 0;
     u32 m_grows = 0;
     bool m_bufferChanged = false;
+    u64 m_fullDetailVersion = 0;
 };
 
 } // namespace engine::render

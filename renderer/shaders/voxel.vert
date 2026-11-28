@@ -52,6 +52,9 @@ const float kOcclusion[4] = float[4](0.42, 0.62, 0.81, 1.0);
 // counter-clockwise.
 const uint kFlipped[4] = uint[4](1u, 3u, 0u, 2u);
 
+// Levels of detail stop growing cells vertically here (kMaxVerticalLodLevel).
+const uint kMaxVerticalLevel = 2u;
+
 // Texture coordinates from the corner's position relative to the quad's first
 // block (0..width / 0..height). The fragment shader wraps it per block, so a merged quad shows one
 // texture tile per block, exactly like separate faces. Side faces put the texture's top edge at the block's top and
@@ -90,14 +93,17 @@ void main()
 
     // Camera-relative: the integer part is exact, so precision does not
     // depend on how far from the world origin the camera is.
-    // At level of detail L a voxel is a 2^L block cube; its texture is
-    // stretched over it (one tile per voxel).
+    // At level of detail L a voxel is 2^L blocks wide and 2^min(L, 2) tall
+    // (see engine/voxel/Generate.hpp); its texture is stretched over it (one
+    // tile per voxel).
     const GpuChunk chunk = chunks[gl_InstanceIndex];
     const uint level = chunk.faces1.w >> 1;
-    const ivec3 voxel = chunk.originFirst.xyz + (ivec3(local) << level) - pc.cameraBlock.xyz;
+    const ivec3 shift = ivec3(int(level), int(min(level, kMaxVerticalLevel)), int(level));
+    const vec3 scale = vec3(ivec3(1) << shift);
+    const ivec3 voxel = chunk.originFirst.xyz + (ivec3(local) << shift) - pc.cameraBlock.xyz;
     const vec2 corner2 = vec2(float(corner & 1u), float(corner >> 1));
     const vec3 inBlock = kBase[face] + kU[face] * (corner2.x * size.x) + kV[face] * (corner2.y * size.y);
-    vec3 pos = vec3(voxel) - pc.cameraFraction.xyz + inBlock * float(1u << level); // relative to the camera
+    vec3 pos = vec3(voxel) - pc.cameraFraction.xyz + inBlock * scale; // relative to the camera
 
     // Greedy meshing leaves T-junctions: a long quad edge runs along the
     // edges of several shorter quads, which meet it at vertices it does not
