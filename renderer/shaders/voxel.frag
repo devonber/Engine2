@@ -12,6 +12,7 @@ layout(location = 0) in vec2 inUV;
 layout(location = 1) in float inDistance;
 layout(location = 2) flat in uint inLayer;
 layout(location = 3) flat in float inShade;
+layout(location = 4) in float inOcclusion; // interpolated across the quad
 
 layout(location = 0) out vec4 outColor;
 
@@ -31,5 +32,5 @@ void main()
 
     // Fog hides the edge of the loaded world and matches the sky clear colour.
     const float f = smoothstep(pc.fog.a * 0.55, pc.fog.a, inDistance);
-    outColor = vec4(mix(albedo * inShade, pc.fog.rgb, f), 1.0);
+    outColor = vec4(mix(albedo * (inShade * inOcclusion), pc.fog.rgb, f), 1.0);
 }

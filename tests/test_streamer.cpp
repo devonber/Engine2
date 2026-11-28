@@ -46,34 +46,39 @@ void settle(ChunkStreamer& streamer, ColumnCoord center, MeshSet& set)
     } while (!streamer.settled());
 }
 
-// What the mesh of `coord` must be: meshed directly against its six
+// What the mesh of `coord` must be: meshed directly against its 26
 // generated neighbours (the slow reference path, reading neighbour chunks).
+// Above the world is air; below it, solid.
 std::vector<PackedQuad> referenceMesh(ChunkCoord c)
 {
+    static const auto solid = [] {
+        auto chunk = std::make_unique<Chunk>();
+        chunk->fill(1);
+        return chunk;
+    }();
     auto self = std::make_unique<Chunk>();
     fillTerrain(*self, c.x, c.y, c.z);
     std::vector<std::unique_ptr<Chunk>> owned;
-    ChunkNeighbours nb;
-    const auto add = [&](Face face, i32 x, i32 y, i32 z) {
-        if (y < 0 || y >= kWorldHeightChunks) {
-            return; // above the world: air (below is handled with setSolid)
+    ChunkNeighbourhood nb;
+    for (i32 dz = -1; dz <= 1; ++dz) {
+        for (i32 dy = -1; dy <= 1; ++dy) {
+            for (i32 dx = -1; dx <= 1; ++dx) {
+                const i32 y = c.y + dy;
+                if ((dx == 0 && dy == 0 && dz == 0) || y >= kWorldHeightChunks) {
+                    continue; // the chunk itself / above the world: air
+                }
+                if (y < 0) {
+                    nb.set(dx, dy, dz, solid.get());
+                    continue;
+                }
+                owned.push_back(std::make_unique<Chunk>());
+                fillTerrain(*owned.back(), c.x + dx, y, c.z + dz);
+                nb.set(dx, dy, dz, owned.back().get());
+            }
         }
-        owned.push_back(std::make_unique<Chunk>());
-        fillTerrain(*owned.back(), x, y, z);
-        nb.chunks[static_cast<usize>(face)] = owned.back().get();
-    };
-    add(Face::PosX, c.x + 1, c.y, c.z);
-    add(Face::NegX, c.x - 1, c.y, c.z);
-    add(Face::PosZ, c.x, c.y, c.z + 1);
-    add(Face::NegZ, c.x, c.y, c.z - 1);
-    add(Face::PosY, c.x, c.y + 1, c.z);
-    add(Face::NegY, c.x, c.y - 1, c.z);
-    BoundaryMasks masks = buildBoundaryMasks(nb);
-    if (c.y == 0) {
-        masks.setSolid(Face::NegY);
     }
     std::vector<PackedQuad> quads;
-    meshChunkGreedy(*self, masks, quads);
+    meshChunkGreedy(*self, buildNeighbourShell(nb), quads);
     return quads;
 }
 

@@ -18,24 +18,30 @@ void runMesherBenchmarks()
     std::vector<PackedQuad> quads;
     quads.reserve(kChunkVolume * 3); // never reallocate inside the timed loop
 
-    // Terrain neighbours on all four sides, solid ground below: a chunk in
-    // the middle of the sandbox world.
-    std::array<std::unique_ptr<Chunk>, 4> side;
-    for (auto& c : side) {
-        c = std::make_unique<Chunk>();
+    // A surface chunk with all 26 terrain neighbours, as in the streamed world.
+    constexpr i32 cx = 0, cy = 1, cz = 0;
+    std::vector<std::unique_ptr<Chunk>> owned;
+    std::vector<OuterLayers> outer(kNeighbourhoodSize);
+    ChunkNeighbourhood terrainNeighbours;
+    std::array<const OuterLayers*, kNeighbourhoodSize> terrainOuter{};
+    for (i32 dz = -1; dz <= 1; ++dz) {
+        for (i32 dy = -1; dy <= 1; ++dy) {
+            for (i32 dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0) {
+                    continue;
+                }
+                owned.push_back(std::make_unique<Chunk>());
+                fillTerrain(*owned.back(), cx + dx, cy + dy, cz + dz);
+                const usize i = neighbourIndex(dx, dy, dz);
+                terrainNeighbours.chunks[i] = owned.back().get();
+                outer[i] = computeOuterLayers(*owned.back());
+                terrainOuter[i] = &outer[i];
+            }
+        }
     }
-    fillTerrain(*side[0], 1, 1, 0);
-    fillTerrain(*side[1], -1, 1, 0);
-    fillTerrain(*side[2], 0, 1, 1);
-    fillTerrain(*side[3], 0, 1, -1);
-    ChunkNeighbours terrainNeighbours;
-    terrainNeighbours.chunks[static_cast<usize>(Face::PosX)] = side[0].get();
-    terrainNeighbours.chunks[static_cast<usize>(Face::NegX)] = side[1].get();
-    terrainNeighbours.chunks[static_cast<usize>(Face::PosZ)] = side[2].get();
-    terrainNeighbours.chunks[static_cast<usize>(Face::NegZ)] = side[3].get();
 
-    const auto bench = [&](const char* title, const ChunkNeighbours& neighbours) {
-        BoundaryMasks masks = buildBoundaryMasks(neighbours);
+    const auto bench = [&](const char* title, const ChunkNeighbourhood& neighbours) {
+        const NeighbourShell shell = buildNeighbourShell(neighbours);
         ankerl::nanobench::Bench b;
         b.title(title).unit("chunk").warmup(50).minEpochTime(std::chrono::milliseconds(20)).relative(true);
         b.run("naive", [&] {
@@ -44,23 +50,31 @@ void runMesherBenchmarks()
         });
         const usize naiveQuads = quads.size();
         b.run("binary", [&] {
-            meshChunkBinary(*chunk, masks, quads);
+            meshChunkBinary(*chunk, shell, quads);
             ankerl::nanobench::doNotOptimizeAway(quads.data());
         });
+        b.run("greedy, no AO", [&] {
+            meshChunkGreedy(*chunk, shell, quads, false);
+            ankerl::nanobench::doNotOptimizeAway(quads.data());
+        });
+        const usize noAoQuads = quads.size();
         b.run("greedy", [&] {
-            meshChunkGreedy(*chunk, masks, quads);
+            meshChunkGreedy(*chunk, shell, quads);
             ankerl::nanobench::doNotOptimizeAway(quads.data());
         });
-        std::printf("quads: naive/binary %zu, greedy %zu (%.1fx fewer)\n", naiveQuads, quads.size(),
-                    quads.empty() ? 0.0 : static_cast<double>(naiveQuads) / static_cast<double>(quads.size()));
-        b.run("boundary masks", [&] {
-            masks = buildBoundaryMasks(neighbours);
-            ankerl::nanobench::doNotOptimizeAway(masks.rows.data());
-        });
+        std::printf(
+            "quads: naive/binary %zu, greedy %zu (%.1fx fewer), greedy without AO %zu\n", naiveQuads, quads.size(),
+            quads.empty() ? 0.0 : static_cast<double>(naiveQuads) / static_cast<double>(quads.size()), noAoQuads);
     };
 
-    fillTerrain(*chunk, 0, 1, 0);
+    fillTerrain(*chunk, cx, cy, cz);
     bench("mesh: terrain, with neighbours", terrainNeighbours);
+    {
+        ankerl::nanobench::Bench b;
+        b.title("neighbour shell").unit("chunk").warmup(50).minEpochTime(std::chrono::milliseconds(20));
+        b.run("from 26 outer layers",
+              [&] { ankerl::nanobench::doNotOptimizeAway(shellFromOuterLayers(terrainOuter).corners); });
+    }
 
     fillRandom(*chunk, 0.5, 42);
     bench("mesh: random 50% (worst case)", {});
