@@ -378,10 +378,10 @@ void Renderer::createIndexBuffer()
         createBufferWithData(m_ctx, indices.data(), indices.size() * sizeof(u32), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
 }
 
-bool Renderer::setChunkMesh(u64 key, glm::ivec3 origin, std::vector<voxel::PackedQuad>&& quads)
+bool Renderer::setChunkMesh(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads)
 {
     ENGINE_ASSERT(quads.size() <= kMaxQuadsPerChunk);
-    return m_meshes->set(key, origin, std::move(quads));
+    return m_meshes->set(key, origin, quads);
 }
 
 void Renderer::removeChunkMesh(u64 key)

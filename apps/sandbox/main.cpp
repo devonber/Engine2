@@ -193,7 +193,8 @@ int main(int argc, char** argv)
                 renderer.removeChunkMesh(e.coord.key());
             } else {
                 constexpr i32 n = static_cast<i32>(voxel::kChunkSize);
-                renderer.setChunkMesh(e.coord.key(), {e.coord.x * n, e.coord.y * n, e.coord.z * n}, std::move(e.quads));
+                renderer.setChunkMesh(e.coord.key(), {e.coord.x * n, e.coord.y * n, e.coord.z * n}, e.quads);
+                streamer.recycle(std::move(e.quads)); // the renderer copied it: reuse the vector
             }
         }
         streamAccumMs += std::chrono::duration<f64, std::milli>(Clock::now() - streamStart).count();

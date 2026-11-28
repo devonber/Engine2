@@ -49,7 +49,10 @@ void runWorldBenchmarks()
             do {
                 const auto u0 = std::chrono::steady_clock::now();
                 streamer.update({x, 0});
-                meshes += streamer.takeMeshEvents().size();
+                for (ChunkMeshEvent& e : streamer.takeMeshEvents()) {
+                    ++meshes;
+                    streamer.recycle(std::move(e.quads)); // as a renderer would after copying
+                }
                 updateMs += std::chrono::duration<f64, std::milli>(std::chrono::steady_clock::now() - u0).count();
                 ++updates;
             } while (!streamer.settled());
@@ -68,9 +71,12 @@ void runWorldBenchmarks()
         const ThreadPool::JobStats js = pool.jobStats();
         // Workers busy for a small fraction of the wall time = starved (by the
         // main thread or the queue), not short of work.
-        std::printf("%s: per area %.0f update() calls, %.0f jobs; workers busy %.0f%% of the time\n", label,
-                    static_cast<f64>(updates) / static_cast<f64>(areas),
-                    static_cast<f64>(js.jobs) / static_cast<f64>(areas),
+        // Average job time should match between 1 worker and many: if it grows
+        // with the worker count, the jobs contend for something (locks, the
+        // allocator, memory bandwidth, shared cores).
+        std::printf("%s: per area %.0f update() calls, %.0f jobs, avg job %.1f us; workers busy %.0f%% of the time\n",
+                    label, static_cast<f64>(updates) / static_cast<f64>(areas),
+                    static_cast<f64>(js.jobs) / static_cast<f64>(areas), 1000.0 * js.busyMs / static_cast<f64>(js.jobs),
                     100.0 * js.busyMs / (wallMs * static_cast<f64>(pool.workerCount())));
     };
 

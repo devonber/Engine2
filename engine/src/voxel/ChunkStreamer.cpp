@@ -116,6 +116,8 @@ ChunkStreamer::ChunkStreamer(ThreadPool& pool, const StreamingOptions& options) 
     }
     std::ranges::stable_sort(m_offsets, {}, [](const auto& o) { return o.first * o.first + o.second * o.second; });
     static_cast<void>(stoneChunk()); // initialise now rather than inside the first mesh job
+    m_completions.reserve(m_maxInFlight);
+    m_drained.reserve(m_maxInFlight);
 }
 
 ChunkStreamer::~ChunkStreamer()
@@ -170,6 +172,15 @@ void ChunkStreamer::update(ColumnCoord center)
     }
 }
 
+void ChunkStreamer::recycle(std::vector<PackedQuad>&& quads)
+{
+    // Keep enough for every job in flight; drop the rest.
+    if (quads.capacity() != 0 && m_spareMeshes.size() < m_maxInFlight) {
+        quads.clear();
+        m_spareMeshes.push_back(std::move(quads));
+    }
+}
+
 std::vector<ChunkMeshEvent> ChunkStreamer::takeMeshEvents()
 {
     return std::exchange(m_events, {});
@@ -182,15 +193,17 @@ ChunkStreamer::Stats ChunkStreamer::stats() const
 
 void ChunkStreamer::collectCompletions()
 {
-    std::vector<Completion> done;
     {
+        // Swap with the main thread's (empty, but allocated) vector, so both
+        // keep their capacity and jobs never reallocate while holding the lock.
         std::lock_guard lock(m_completionMutex);
-        done.swap(m_completions);
+        m_drained.swap(m_completions);
     }
-    for (Completion& c : done) {
+    for (Completion& c : m_drained) {
         --m_inFlight;
         complete(std::move(c));
     }
+    m_drained.clear();
 }
 
 void ChunkStreamer::complete(Completion&& c)
@@ -200,10 +213,11 @@ void ChunkStreamer::complete(Completion&& c)
 
     if (c.layer < 0) {
         column->state = State::Ready;
+        const GenerateOutput& out = *column->generated;
         for (usize i = 0; i < kLayers; ++i) {
             ChunkState& cs = column->chunks[i];
-            cs.content = c.contents[i];
-            cs.outer = c.outer[i];
+            cs.content = out.contents[i];
+            cs.outer = out.outer[i];
             if (cs.content != ChunkContent::Mixed) {
                 m_chunkPool.release(cs.data); // uniform: no storage needed
                 cs.data = nullptr;
@@ -211,6 +225,7 @@ void ChunkStreamer::complete(Completion&& c)
                 ++m_stored;
             }
         }
+        column->generated.reset();
         return;
     }
 
@@ -227,6 +242,8 @@ void ChunkStreamer::complete(Completion&& c)
         cs.hasMesh = true;
         ++m_meshed;
         m_events.push_back({{c.column.x, c.layer, c.column.z}, std::move(c.quads), false});
+    } else {
+        recycle(std::move(c.quads));
     }
 }
 
@@ -329,8 +346,9 @@ void ChunkStreamer::finish(Completion&& completion)
 {
     std::lock_guard lock(m_completionMutex);
     m_completions.push_back(std::move(completion));
-    --m_running;
-    m_jobsDone.notify_all(); // under the lock: see the header
+    if (--m_running == 0) {
+        m_jobsDone.notify_all(); // under the lock: see the header. Only the destructor waits for this.
+    }
 }
 
 void ChunkStreamer::submitGenerate(ColumnCoord coord)
@@ -343,27 +361,28 @@ void ChunkStreamer::submitGenerate(ColumnCoord coord)
         storage[i] = m_chunkPool.acquire();
         col.chunks[i].data = storage[i];
     }
-    m_columns.emplace(coord.key(), col);
+    col.generated = std::make_unique<GenerateOutput>();
+    GenerateOutput* out = col.generated.get(); // stable: owned by the column until completion
+    m_columns.emplace(coord.key(), std::move(col));
     trackSubmit();
 
-    m_batch.emplace_back([this, coord, storage] {
+    m_batch.emplace_back([this, coord, storage, out] {
         ENGINE_PROFILE_SCOPE("generate column");
         TerrainColumn terrain;
         terrainColumn(coord.x, coord.z, terrain); // one heightmap for every layer
-        Completion done{.column = coord, .layer = -1};
         for (usize i = 0; i < kLayers; ++i) {
             const i32 layer = static_cast<i32>(i);
-            done.contents[i] = classifyTerrainChunk(terrain, layer);
-            if (done.contents[i] == ChunkContent::Mixed) {
+            out->contents[i] = classifyTerrainChunk(terrain, layer);
+            if (out->contents[i] == ChunkContent::Mixed) {
                 fillTerrainChunk(*storage[i], terrain, layer); // writes every voxel
                 // While the chunk is in this core's cache: record its outer
                 // layers, which is all its neighbours' meshing needs from it.
-                done.outer[i] = computeOuterLayers(*storage[i]);
+                out->outer[i] = computeOuterLayers(*storage[i]);
             } else {
-                done.outer[i] = uniformOuterLayers(done.contents[i]);
+                out->outer[i] = uniformOuterLayers(out->contents[i]);
             }
         }
-        finish(std::move(done));
+        finish({.column = coord, .layer = -1, .quads = {}});
     });
 }
 
@@ -410,18 +429,23 @@ bool ChunkStreamer::scheduleMeshes(Column& col)
         cs.meshing = true; // keeps the column loaded while the job reads the chunk
         trackSubmit();
         const Chunk* chunk = cs.data != nullptr ? cs.data : &stoneChunk();
+        // The job meshes straight into a recycled vector (see recycle()), so
+        // once warmed up it does no heap allocation: allocating on many
+        // threads at once contends inside the allocator.
+        std::vector<PackedQuad> out;
+        if (!m_spareMeshes.empty()) {
+            out = std::move(m_spareMeshes.back());
+            m_spareMeshes.pop_back();
+        }
         m_batch.emplace_back([this, coord = col.coord, layer = static_cast<i32>(i), chunk, masks,
-                              greedy = m_options.greedy] {
+                              greedy = m_options.greedy, out = std::move(out)]() mutable {
             ENGINE_PROFILE_SCOPE("mesh chunk");
-            // Mesh into a per-thread scratch buffer (capacity reused), then
-            // copy out with one exact-size allocation.
-            thread_local std::vector<PackedQuad> scratch;
             if (greedy) {
-                meshChunkGreedy(*chunk, masks, scratch);
+                meshChunkGreedy(*chunk, masks, out);
             } else {
-                meshChunkBinary(*chunk, masks, scratch);
+                meshChunkBinary(*chunk, masks, out);
             }
-            finish({.column = coord, .layer = layer, .quads = std::vector<PackedQuad>(scratch.begin(), scratch.end())});
+            finish({.column = coord, .layer = layer, .quads = std::move(out)});
         });
     }
 
