@@ -31,6 +31,13 @@ struct RendererDesc {
     u64 uploadBudgetBytes = 4u * 1024 * 1024; // mesh data copied to the GPU per frame, at most
     bool faceCulling = true;                  // skip each chunk's face directions that point away from the camera
     bool gpuCulling = true; // cull on the GPU (compute + draw-indirect-count); on the CPU if off or unsupported
+
+    // Levels of detail (see setChunkMesh). Level L >= 1 is hidden closer to
+    // the camera than lodSeam * 2^(L - 1) blocks (horizontally), where the
+    // finer level L - 1 is drawn instead; the finer level is drawn as far as
+    // it has meshes, a little beyond the seam, so there are no gaps.
+    // 0 = no seams (every chunk drawn wherever it is).
+    f32 lodSeam = 0.0f;
 };
 
 struct FrameStats {
@@ -39,6 +46,8 @@ struct FrameStats {
     u32 draws = 0;       // indirect draws (up to 3 per chunk: runs of face directions)
     u64 drawnQuads = 0;
     f64 cullMs = 0.0;       // CPU time culling chunks and writing the draws (CPU culling only)
+    f64 waitMs = 0.0;       // CPU time blocked waiting for the GPU (frame slot fence, swapchain image)
+    u32 seamDraws = 0;      // of `draws`: coarse-level draws crossing a seam (need the discard pipeline)
     bool gpuCulled = false; // counts above come from the GPU, a couple of frames late
     u64 uploadedBytes = 0;  // mesh data copied to the GPU this frame
 };
@@ -65,10 +74,10 @@ public:
     Renderer& operator=(const Renderer&) = delete;
 
     // Add or replace the mesh of the chunk identified by `key`; `origin` is the
-    // world position of its voxel (0,0,0). The quads are copied. Uploaded in the background over
-    // the next frames (see RendererDesc::uploadBudgetBytes). False if there is
-    // no room. Call between frames.
-    bool setChunkMesh(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads);
+    // world position (in blocks) of its voxel (0,0,0). At level of detail L
+    // each voxel is 2^L blocks wide (a chunk covers 32 * 2^L blocks). The quads are copied. Uploaded in the background
+    // over the next frames (see RendererDesc::uploadBudgetBytes). False if there is no room. Call between frames.
+    bool setChunkMesh(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads, u32 level = 0);
     void removeChunkMesh(u64 key);
     [[nodiscard]] MeshMemoryStats meshStats() const;
     [[nodiscard]] bool gpuCulling() const noexcept { return m_gpuCulling; }
@@ -109,8 +118,13 @@ private:
     void createIndexBuffer();
     void destroyTextures();
     void recreateSwapchain();
-    [[nodiscard]] u32 cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& stats) const;
-    [[nodiscard]] VkDeviceSize recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Camera& camera,
+    // Draw counts: interior draws at [0, m_maxDraws), seam draws at [m_maxDraws, 2 * m_maxDraws).
+    struct DrawCounts {
+        u32 interior = 0;
+        u32 seam = 0;
+    };
+    [[nodiscard]] DrawCounts cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& stats) const;
+    [[nodiscard]] VkDeviceSize recordFrame(Frame& frame, u32 imageIndex, DrawCounts draws, const Camera& camera,
                                            bool screenshot);
     void writeScreenshot();
     [[nodiscard]] f64 readGpuTime(u32 frameIndex) const;
@@ -129,6 +143,7 @@ private:
     VkDescriptorSet m_set = VK_NULL_HANDLE;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
+    VkPipeline m_seamPipeline = VK_NULL_HANDLE; // same, discarding fragments inside a chunk's LOD seam
     VkFormat m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
 
     Buffer m_indexBuffer; // shared quad index pattern, sized for the densest possible chunk

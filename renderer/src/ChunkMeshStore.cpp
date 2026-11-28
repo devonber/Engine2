@@ -56,7 +56,7 @@ ChunkMeshStore::~ChunkMeshStore()
     destroyBuffer(allocator, m_chunkTable);
 }
 
-bool ChunkMeshStore::set(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads)
+bool ChunkMeshStore::set(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads, u32 level)
 {
     if (const auto it = m_slotOf.find(key); it != m_slotOf.end()) {
         releaseSlot(it->second); // the old mesh may still be drawn by in-flight frames
@@ -104,6 +104,7 @@ bool ChunkMeshStore::set(u64 key, glm::ivec3 origin, std::span<const voxel::Pack
     }
 
     slot.origin = origin;
+    slot.level = level;
     slot.quadCount = static_cast<u32>(quads.size());
     slot.faceStart = start;
     slot.used = true;
@@ -232,7 +233,7 @@ GpuChunk ChunkMeshStore::gpuRecord(const Slot& slot) const noexcept
     return GpuChunk{
         .originFirst = glm::ivec4{slot.origin, static_cast<i32>(slot.firstQuad)},
         .faces0 = glm::uvec4{f[0], f[1], f[2], f[3]},
-        .faces1 = glm::uvec4{f[4], f[5], f[6], drawable},
+        .faces1 = glm::uvec4{f[4], f[5], f[6], drawable | (slot.level << 1)},
     };
 }
 

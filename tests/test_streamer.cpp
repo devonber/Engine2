@@ -49,7 +49,7 @@ void settle(ChunkStreamer& streamer, ColumnCoord center, MeshSet& set)
 // What the mesh of `coord` must be: meshed directly against its 26
 // generated neighbours (the slow reference path, reading neighbour chunks).
 // Above the world is air; below it, solid.
-std::vector<PackedQuad> referenceMesh(ChunkCoord c)
+std::vector<PackedQuad> referenceMesh(ChunkCoord c, u32 level)
 {
     static const auto solid = [] {
         auto chunk = std::make_unique<Chunk>();
@@ -57,7 +57,7 @@ std::vector<PackedQuad> referenceMesh(ChunkCoord c)
         return chunk;
     }();
     auto self = std::make_unique<Chunk>();
-    fillTerrain(*self, c.x, c.y, c.z);
+    fillTerrain(*self, c.x, c.y, c.z, level);
     std::vector<std::unique_ptr<Chunk>> owned;
     ChunkNeighbourhood nb;
     for (i32 dz = -1; dz <= 1; ++dz) {
@@ -72,7 +72,7 @@ std::vector<PackedQuad> referenceMesh(ChunkCoord c)
                     continue;
                 }
                 owned.push_back(std::make_unique<Chunk>());
-                fillTerrain(*owned.back(), c.x + dx, y, c.z + dz);
+                fillTerrain(*owned.back(), c.x + dx, y, c.z + dz, level);
                 nb.set(dx, dy, dz, owned.back().get());
             }
         }
@@ -83,7 +83,7 @@ std::vector<PackedQuad> referenceMesh(ChunkCoord c)
 }
 
 // Every non-empty chunk mesh within `radius` columns of `center`.
-std::map<ChunkCoord, std::vector<PackedQuad>> expectedMeshes(ColumnCoord center, i32 radius)
+std::map<ChunkCoord, std::vector<PackedQuad>> expectedMeshes(ColumnCoord center, i32 radius, u32 level)
 {
     std::map<ChunkCoord, std::vector<PackedQuad>> out;
     for (i32 dz = -radius; dz <= radius; ++dz) {
@@ -93,7 +93,7 @@ std::map<ChunkCoord, std::vector<PackedQuad>> expectedMeshes(ColumnCoord center,
             }
             for (i32 y = 0; y < kWorldHeightChunks; ++y) {
                 const ChunkCoord c{center.x + dx, y, center.z + dz};
-                auto quads = referenceMesh(c);
+                auto quads = referenceMesh(c, level);
                 if (!quads.empty()) {
                     out[c] = std::move(quads);
                 }
@@ -103,9 +103,9 @@ std::map<ChunkCoord, std::vector<PackedQuad>> expectedMeshes(ColumnCoord center,
     return out;
 }
 
-void checkMatches(const MeshSet& set, ColumnCoord center, i32 radius)
+void checkMatches(const MeshSet& set, ColumnCoord center, i32 radius, u32 level = 0)
 {
-    const auto expected = expectedMeshes(center, radius);
+    const auto expected = expectedMeshes(center, radius, level);
     REQUIRE(set.meshes.size() == expected.size());
     for (const auto& [coord, quads] : expected) {
         CAPTURE(coord.x);
@@ -127,11 +127,17 @@ TEST_CASE("Coordinates: columnAt floors, chunk keys are unique")
     CHECK(columnAt(-32.1, 5.0) == ColumnCoord{-2, 0});
     // Far from the origin (double precision): 1,000,000 / 32 = 31250 exactly.
     CHECK(columnAt(1'000'000.0 - 0.001, 1'000'000.0) == ColumnCoord{31249, 31250});
+    // Coarser levels: columns 32 << level blocks wide.
+    CHECK(columnAt(63.9, -0.1, 1) == ColumnCoord{0, -1});
+    CHECK(columnAt(64.0, 255.9, 3) == ColumnCoord{0, 0});
+    CHECK(columnAt(-256.1, 256.0, 3) == ColumnCoord{-2, 1});
     std::set<u64> keys;
-    for (i32 x : {-2, -1, 0, 1, 2}) {
-        for (i32 y : {-1, 0, 1, 3}) {
-            for (i32 z : {-2, -1, 0, 1, 2}) {
-                REQUIRE(keys.insert(ChunkCoord{x, y, z}.key()).second);
+    for (u32 level : {0u, 1u, 3u}) {
+        for (i32 x : {-2, -1, 0, 1, 2}) {
+            for (i32 y : {-1, 0, 1, 3}) {
+                for (i32 z : {-2, -1, 0, 1, 2}) {
+                    REQUIRE(keys.insert(ChunkCoord{x, y, z}.key(level)).second);
+                }
             }
         }
     }
@@ -147,6 +153,22 @@ TEST_CASE("Streaming meshes exactly the visible chunks in view, matching direct 
     CHECK(streamer.stats().jobsInFlight == 0);
     // Uniform chunks (all air or all stone) take no storage.
     CHECK(streamer.stats().storedChunks < streamer.stats().loadedColumns * kWorldHeightChunks);
+}
+
+TEST_CASE("Coarse levels of detail stream like level 0, with their own generator and coordinates")
+{
+    ThreadPool pool(3);
+    for (u32 level : {1u, 2u, 4u}) {
+        CAPTURE(level);
+        ChunkStreamer streamer(pool, {.viewRadius = 2, .level = level});
+        MeshSet set;
+        settle(streamer, {-3, 5}, set);
+        checkMatches(set, {-3, 5}, 2, level);
+        // Coarse levels are shorter in cells: no meshes above their top layer.
+        for (const auto& [coord, quads] : set.meshes) {
+            CHECK(coord.y < worldHeightChunks(level));
+        }
+    }
 }
 
 TEST_CASE("Moving away unloads old columns and reuses their memory")

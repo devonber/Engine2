@@ -4,7 +4,9 @@
 // Controls: left-click to capture the mouse, Esc to release it.
 //           WASD move, Space/Shift up/down, Ctrl to go fast.
 //
-// Options:  --radius N        view radius in chunks (default 12)
+// Options:  --radius N        view radius in chunks, per level of detail (default 12)
+//           --lod-levels N    levels of detail (default 4): level L has voxels of 2^L blocks and
+//                             reaches 2^L times as far; 1 = full detail only
 //           --vsync           cap to display refresh (default: uncapped)
 //           --validation      force the Vulkan validation layer on (always on in Debug)
 //           --no-validation   force it off
@@ -46,6 +48,7 @@ namespace {
 
 struct Options {
     i32 radius = 12;
+    u32 lodLevels = 4;
     bool vsync = false;
     bool validation = ENGINE_ENABLE_ASSERTS != 0; // on in Debug builds
     i64 frames = -1;
@@ -69,6 +72,8 @@ Options parseArgs(int argc, char** argv)
         const auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
         if (arg("--radius")) {
             o.radius = std::clamp(std::atoi(next()), 1, 96);
+        } else if (arg("--lod-levels")) {
+            o.lodLevels = static_cast<u32>(std::clamp(std::atoi(next()), 1, 6));
         } else if (arg("--vsync")) {
             o.vsync = true;
         } else if (arg("--validation")) {
@@ -143,13 +148,20 @@ int main(int argc, char** argv)
 
     platform::Window window("Engine2", 1600, 900);
     render::VulkanContext ctx(window, {.appName = "Engine2 Sandbox", .validation = opt.validation});
+    // Each level of detail streams the same radius in its own (2^L times
+    // larger) chunks. Level L takes over from level L - 1 at the seam,
+    // a little inside where level L - 1 is guaranteed to have meshes.
+    const u32 lodLevels = opt.radius >= 4 ? opt.lodLevels : 1;
+    const f32 levelRadius = static_cast<f32>(opt.radius) * 32.0f; // blocks, at level 0
+    const f32 farthest = levelRadius * static_cast<f32>(1u << (lodLevels - 1));
     render::Renderer renderer(ctx, window,
                               {
                                   .presentMode = opt.vsync ? render::PresentMode::Vsync : render::PresentMode::Uncapped,
-                                  .fogDistance = static_cast<f32>(opt.radius) * 32.0f * 0.95f,
+                                  .fogDistance = farthest * 0.95f,
                                   .quadCapacity = static_cast<u64>(opt.meshMemoryMiB) * 1024 * 1024 / 8,
                                   .faceCulling = opt.faceCulling,
                                   .gpuCulling = opt.gpuCulling,
+                                  .lodSeam = lodLevels > 1 ? static_cast<f32>(opt.radius - 3) * 32.0f : 0.0f,
                               });
 
     using Clock = std::chrono::steady_clock;
@@ -165,10 +177,39 @@ int main(int argc, char** argv)
     // Background workers for generation and meshing. --threads counts the
     // main thread too, so the pool gets one fewer.
     ThreadPool pool(opt.threads == 0 ? 0u : std::max(opt.threads, 2u) - 1);
-    voxel::ChunkStreamer streamer(pool, {.viewRadius = opt.radius, .greedy = opt.greedy, .ambientOcclusion = opt.ao});
+    // One streamer per level of detail. Updated finest first, so each frame
+    // the nearby (most visible) work is queued ahead of the distant work.
+    std::vector<std::unique_ptr<voxel::ChunkStreamer>> streamers;
+    for (u32 level = 0; level < lodLevels; ++level) {
+        streamers.push_back(std::make_unique<voxel::ChunkStreamer>(
+            pool, voxel::StreamingOptions{
+                      .viewRadius = opt.radius,
+                      .level = level,
+                      .greedy = opt.greedy,
+                      .ambientOcclusion = opt.ao,
+                      // Fewer queued jobs for the coarse levels, so they cannot
+                      // crowd out nearby work when the camera moves.
+                      .maxJobsInFlight = level == 0 ? 0u : 8u * pool.concurrency(),
+                  }));
+    }
+    const auto streamStats = [&] {
+        voxel::ChunkStreamer::Stats total;
+        for (const auto& s : streamers) {
+            const voxel::ChunkStreamer::Stats ss = s->stats();
+            total.loadedColumns += ss.loadedColumns;
+            total.storedChunks += ss.storedChunks;
+            total.meshedChunks += ss.meshedChunks;
+            total.jobsInFlight += ss.jobsInFlight;
+            total.poolChunks += ss.poolChunks;
+        }
+        return total;
+    };
     std::fprintf(stderr, "Culling: %s\n", renderer.gpuCulling() ? "GPU (compute + draw indirect count)" : "CPU");
-    std::fprintf(stderr, "Streaming: view radius %d chunks, %u worker threads, %s meshing\n", opt.radius,
-                 pool.workerCount(), opt.greedy ? "greedy" : "binary");
+    std::fprintf(stderr,
+                 "Streaming: view radius %d chunks x %u levels of detail (%.0f blocks), %u worker threads, %s "
+                 "meshing\n",
+                 opt.radius, lodLevels, static_cast<f64>(farthest), pool.workerCount(),
+                 opt.greedy ? "greedy" : "binary");
 
     render::Camera camera;
     camera.position = {opt.camera[0], opt.camera[1], opt.camera[2]};
@@ -177,7 +218,7 @@ int main(int argc, char** argv)
 
     // Title-bar stats, averaged over half a second.
     auto statsStart = Clock::now();
-    f64 cpuAccumMs = 0.0, gpuAccumMs = 0.0, streamAccumMs = 0.0, cullAccumMs = 0.0;
+    f64 cpuAccumMs = 0.0, gpuAccumMs = 0.0, streamAccumMs = 0.0, cullAccumMs = 0.0, waitAccumMs = 0.0;
     u64 uploadAccum = 0;
     u32 statFrames = 0;
 
@@ -207,22 +248,27 @@ int main(int argc, char** argv)
 
         // Streaming: schedule work around the camera, hand finished meshes to the GPU.
         const auto streamStart = Clock::now();
-        const voxel::ColumnCoord centre = voxel::columnAt(camera.position.x, camera.position.z);
-        streamer.update(centre);
-        for (voxel::ChunkMeshEvent& e : streamer.takeMeshEvents()) {
-            if (e.removed) {
-                renderer.removeChunkMesh(e.coord.key());
-            } else {
-                constexpr i32 n = static_cast<i32>(voxel::kChunkSize);
-                renderer.setChunkMesh(e.coord.key(), {e.coord.x * n, e.coord.y * n, e.coord.z * n}, e.quads);
-                streamer.recycle(std::move(e.quads)); // the renderer copied it: reuse the vector
+        bool settled = true;
+        for (const auto& streamer : streamers) {
+            const u32 level = streamer->level();
+            streamer->update(voxel::columnAt(camera.position.x, camera.position.z, level));
+            for (voxel::ChunkMeshEvent& e : streamer->takeMeshEvents()) {
+                if (e.removed) {
+                    renderer.removeChunkMesh(e.coord.key(level));
+                } else {
+                    const i32 n = static_cast<i32>(voxel::kChunkSize) << level; // blocks per chunk
+                    renderer.setChunkMesh(e.coord.key(level), {e.coord.x * n, e.coord.y * n, e.coord.z * n}, e.quads,
+                                          level);
+                    streamer->recycle(std::move(e.quads)); // the renderer copied it: reuse the vector
+                }
             }
+            settled &= streamer->settled();
         }
         streamAccumMs += std::chrono::duration<f64, std::milli>(Clock::now() - streamStart).count();
 
-        if (!loaded && streamer.settled() && renderer.meshStats().pendingBytes == 0) {
+        if (!loaded && settled && renderer.meshStats().pendingBytes == 0) {
             loaded = true;
-            const voxel::ChunkStreamer::Stats ss = streamer.stats();
+            const voxel::ChunkStreamer::Stats ss = streamStats();
             const render::MeshMemoryStats ms = renderer.meshStats();
             std::fprintf(stderr,
                          "Initial area loaded in %.1f ms: %u columns (%u chunks stored), %u chunk meshes, %.2fM quads "
@@ -237,7 +283,8 @@ int main(int argc, char** argv)
 
         const auto cpuStart = Clock::now();
         const render::FrameStats stats = renderer.renderFrame(camera);
-        cpuAccumMs += std::chrono::duration<f64, std::milli>(Clock::now() - cpuStart).count();
+        cpuAccumMs += std::chrono::duration<f64, std::milli>(Clock::now() - cpuStart).count() - stats.waitMs;
+        waitAccumMs += stats.waitMs;
         gpuAccumMs += stats.gpuMs;
         cullAccumMs += stats.cullMs;
         uploadAccum += stats.uploadedBytes;
@@ -249,15 +296,17 @@ int main(int argc, char** argv)
 
         const f64 elapsed = std::chrono::duration<f64>(Clock::now() - statsStart).count();
         if (elapsed >= 0.5) {
-            const voxel::ChunkStreamer::Stats ss = streamer.stats();
+            const voxel::ChunkStreamer::Stats ss = streamStats();
             const render::MeshMemoryStats ms = renderer.meshStats();
+            // render cpu excludes waiting for the GPU (shown separately as wait).
             const std::string title = std::format(
-                "Engine2 | {:.0f} fps | render cpu {:.2f} ms (cpu cull {:.2f}) | gpu {:.2f} ms | stream {:.2f} ms | "
-                "{} chunks, {} draws, {:.2f}M quads | {} meshed, {} jobs, {:.1f} MB/s up, mesh mem {:.0f}/{:.0f} MiB",
-                statFrames / elapsed, cpuAccumMs / statFrames, cullAccumMs / statFrames, gpuAccumMs / statFrames,
-                streamAccumMs / statFrames, stats.drawnChunks, stats.draws, static_cast<f64>(stats.drawnQuads) / 1e6,
-                ss.meshedChunks, ss.jobsInFlight, static_cast<f64>(uploadAccum) / elapsed / 1e6,
-                static_cast<f64>(ms.usedBytes) / (1024.0 * 1024.0),
+                "Engine2 | {:.0f} fps | render cpu {:.2f} ms (cpu cull {:.2f}), wait {:.2f} ms | gpu {:.2f} ms | "
+                "stream {:.2f} ms | {} chunks, {} draws ({} seam), {:.2f}M quads | {} meshed, {} jobs, {:.1f} MB/s up, "
+                "mesh mem {:.0f}/{:.0f} MiB",
+                statFrames / elapsed, cpuAccumMs / statFrames, cullAccumMs / statFrames, waitAccumMs / statFrames,
+                gpuAccumMs / statFrames, streamAccumMs / statFrames, stats.drawnChunks, stats.draws, stats.seamDraws,
+                static_cast<f64>(stats.drawnQuads) / 1e6, ss.meshedChunks, ss.jobsInFlight,
+                static_cast<f64>(uploadAccum) / elapsed / 1e6, static_cast<f64>(ms.usedBytes) / (1024.0 * 1024.0),
                 static_cast<f64>(ms.capacityBytes) / (1024.0 * 1024.0));
             window.setTitle(title.c_str());
             if (opt.frames >= 0) {
@@ -273,7 +322,7 @@ int main(int argc, char** argv)
                 lastGrows = ms.grows;
             }
             statsStart = Clock::now();
-            cpuAccumMs = gpuAccumMs = streamAccumMs = cullAccumMs = 0.0;
+            cpuAccumMs = gpuAccumMs = streamAccumMs = cullAccumMs = waitAccumMs = 0.0;
             uploadAccum = 0;
             statFrames = 0;
         }

@@ -5,6 +5,7 @@
 #include "engine/render/Camera.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -30,6 +31,20 @@ constexpr u32 kVoxelFragSpv[] =
 
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
+// Fully fogged beyond this distance from the camera to a chunk's centre: fog
+// distance plus (more than) half a chunk's diagonal (27.7 blocks at level 0).
+f32 cullDistance(f32 fogDistance, u32 level) noexcept
+{
+    return fogDistance + 56.0f * static_cast<f32>(1u << level);
+}
+
+// Horizontal radius inside which a chunk of `level` is not drawn: there the
+// finer level is. 0 for level 0 or without LOD seams.
+f32 lodInnerRadius(f32 seam, u32 level) noexcept
+{
+    return level == 0 ? 0.0f : seam * static_cast<f32>(1u << (level - 1));
+}
+
 // Densest possible chunk is a 3D checkerboard: half the voxels solid, all 6 faces visible.
 constexpr u32 kMaxQuadsPerChunk = voxel::kChunkVolume / 2 * 6;
 
@@ -39,7 +54,7 @@ constexpr f32 kSky[3] = {0.36f, 0.58f, 0.92f};
 struct PushConstants {
     glm::mat4 viewProj;       // projection * rotation only: the camera is at the origin
     glm::ivec4 cameraBlock;   // xyz: integer block containing the camera
-    glm::vec4 cameraFraction; // xyz: camera position within that block
+    glm::vec4 cameraFraction; // xyz: camera position within that block; w: LOD seam radius of level 1 (0: none)
     glm::vec4 fog;
 };
 static_assert(sizeof(PushConstants) <= 128, "128 bytes is the guaranteed minimum push constant size");
@@ -47,9 +62,9 @@ static_assert(sizeof(PushConstants) <= 128, "128 bytes is the guaranteed minimum
 // Push constants of the culling compute shader (shaders/cull.comp).
 struct CullPushConstants {
     glm::ivec4 cameraBlock;
-    glm::vec4 cameraFraction; // w: squared culling distance
+    glm::vec4 cameraFraction; // w: fog distance
     glm::vec4 planes[5];
-    glm::uvec4 params; // x: slot count, y: face culling, z: draw capacity
+    glm::uvec4 params; // x: slot count, y: face culling, z: draw capacity (per list), w: LOD seam radius (f32 bits)
 };
 static_assert(sizeof(CullPushConstants) == 128);
 
@@ -206,7 +221,8 @@ Renderer::Renderer(VulkanContext& ctx, platform::Window& window, const RendererD
         VK_CHECK(vkCreateSemaphore(device, &semInfo, nullptr, &f.imageAcquired));
         // Worst case: every resident chunk visible.
         // Up to 3 draws per chunk (runs of face directions facing the camera).
-        f.indirect = createBuffer(m_ctx.allocator(), desc.maxChunks * 3 * sizeof(VkDrawIndexedIndirectCommand),
+        // Two lists: interior draws, then seam draws (see DrawCounts).
+        f.indirect = createBuffer(m_ctx.allocator(), 2 * desc.maxChunks * 3 * sizeof(VkDrawIndexedIndirectCommand),
                                   VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, MemoryKind::Upload);
     }
 
@@ -274,7 +290,7 @@ void Renderer::createCulling()
 
     for (Frame& f : m_frames) {
         f.gpuDraws =
-            createBuffer(m_ctx.allocator(), m_maxDraws * sizeof(VkDrawIndexedIndirectCommand),
+            createBuffer(m_ctx.allocator(), 2 * m_maxDraws * sizeof(VkDrawIndexedIndirectCommand), // interior + seam
                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, MemoryKind::GpuOnly);
         f.counters = createBuffer(m_ctx.allocator(), 4 * sizeof(u32),
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
@@ -360,13 +376,12 @@ void Renderer::recordCulling(VkCommandBuffer cmd, Frame& frame, const Camera& ca
     const VkExtent2D extent = m_swapchain->extent();
     const f32 aspect = static_cast<f32>(extent.width) / static_cast<f32>(extent.height);
     const Frustum frustum = Frustum::fromViewProj(camera.projection(aspect) * camera.viewRotation());
-    const f32 maxDist = m_desc.fogDistance + 56.0f; // fully fogged beyond (as on the CPU path)
     const u32 slots = m_meshes->slotCount();
     CullPushConstants pc{
         .cameraBlock = glm::ivec4{camera.cameraBlock(), 0},
-        .cameraFraction = glm::vec4{camera.cameraFraction(), maxDist * maxDist},
+        .cameraFraction = glm::vec4{camera.cameraFraction(), m_desc.fogDistance},
         .planes = {},
-        .params = glm::uvec4{slots, m_desc.faceCulling ? 1u : 0u, m_maxDraws, 0u},
+        .params = glm::uvec4{slots, m_desc.faceCulling ? 1u : 0u, m_maxDraws, std::bit_cast<u32>(m_desc.lodSeam)},
     };
     for (usize i = 0; i < 5; ++i) {
         pc.planes[i] = frustum.planes[i];
@@ -425,6 +440,7 @@ Renderer::~Renderer()
         destroyCulling();
     }
     vkDestroyPipeline(device, m_pipeline, nullptr);
+    vkDestroyPipeline(device, m_seamPipeline, nullptr);
     vkDestroyPipelineLayout(device, m_pipelineLayout, nullptr);
     vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
     vkDestroyDescriptorSetLayout(device, m_setLayout, nullptr);
@@ -437,12 +453,23 @@ void Renderer::createPipeline()
     VkDevice device = m_ctx.device();
     if (m_pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device, m_pipeline, nullptr);
+        vkDestroyPipeline(device, m_seamPipeline, nullptr);
     }
 
     VkShaderModule vert = createShaderModule(device, kVoxelVertSpv);
     VkShaderModule frag = createShaderModule(device, kVoxelFragSpv);
 
-    const VkPipelineShaderStageCreateInfo stages[] = {
+    // Two variants: the seam pipeline discards fragments inside the chunk's
+    // LOD seam (specialisation constant 0 in voxel.frag). Everything else
+    // uses the plain one, so early depth testing stays fully effective.
+    const VkSpecializationMapEntry discardEntry{.constantID = 0, .offset = 0, .size = sizeof(VkBool32)};
+    const VkBool32 discardOff = VK_FALSE;
+    const VkBool32 discardOn = VK_TRUE;
+    const VkSpecializationInfo plainSpec{
+        .mapEntryCount = 1, .pMapEntries = &discardEntry, .dataSize = sizeof(VkBool32), .pData = &discardOff};
+    const VkSpecializationInfo seamSpec{
+        .mapEntryCount = 1, .pMapEntries = &discardEntry, .dataSize = sizeof(VkBool32), .pData = &discardOn};
+    VkPipelineShaderStageCreateInfo stages[] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
          .stage = VK_SHADER_STAGE_VERTEX_BIT,
          .module = vert,
@@ -450,7 +477,8 @@ void Renderer::createPipeline()
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
          .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
          .module = frag,
-         .pName = "main"},
+         .pName = "main",
+         .pSpecializationInfo = &plainSpec},
     };
     const VkPipelineVertexInputStateCreateInfo vertexInput{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO}; // vertex pulling: no attributes
@@ -505,7 +533,7 @@ void Renderer::createPipeline()
         .depthAttachmentFormat = kDepthFormat,
     };
 
-    const VkGraphicsPipelineCreateInfo info{
+    VkGraphicsPipelineCreateInfo info{
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &rendering,
         .stageCount = 2,
@@ -521,6 +549,8 @@ void Renderer::createPipeline()
         .layout = m_pipelineLayout,
     };
     VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &m_pipeline));
+    stages[1].pSpecializationInfo = &seamSpec;
+    VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &m_seamPipeline));
 
     vkDestroyShaderModule(device, vert, nullptr);
     vkDestroyShaderModule(device, frag, nullptr);
@@ -586,10 +616,11 @@ void Renderer::createIndexBuffer()
         createBufferWithData(m_ctx, indices.data(), indices.size() * sizeof(u32), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
 }
 
-bool Renderer::setChunkMesh(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads)
+bool Renderer::setChunkMesh(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads, u32 level)
 {
     ENGINE_ASSERT(quads.size() <= kMaxQuadsPerChunk);
-    return m_meshes->set(key, origin, quads);
+    ENGINE_ASSERT(level < 16);
+    return m_meshes->set(key, origin, quads, level);
 }
 
 void Renderer::removeChunkMesh(u64 key)
@@ -737,7 +768,7 @@ void Renderer::recreateSwapchain()
     }
 }
 
-u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& stats) const
+Renderer::DrawCounts Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& stats) const
 {
     ENGINE_PROFILE_FUNCTION();
     const auto start = std::chrono::steady_clock::now();
@@ -745,25 +776,38 @@ u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& 
     const f32 aspect = static_cast<f32>(extent.width) / static_cast<f32>(extent.height);
     // Everything here is relative to the camera, like the vertex shader.
     const Frustum frustum = Frustum::fromViewProj(camera.projection(aspect) * camera.viewRotation());
-    const f32 maxDistSq = (m_desc.fogDistance + 56.0f) * (m_desc.fogDistance + 56.0f); // fully fogged beyond
     const glm::ivec3 camBlock = camera.cameraBlock();
     const glm::vec3 camFrac = camera.cameraFraction();
 
     auto* cmds = static_cast<VkDrawIndexedIndirectCommand*>(frame.indirect.mapped);
-    u32 count = 0;
-    constexpr f32 kSize = static_cast<f32>(voxel::kChunkSize);
+    DrawCounts counts;
     const std::span<const ChunkMeshStore::Slot> slots = m_meshes->slots();
     for (u32 i = 0; i < slots.size(); ++i) {
         const ChunkMeshStore::Slot& c = slots[i];
         if (!c.drawable || c.quadCount == 0) {
             continue;
         }
+        const f32 size = static_cast<f32>(voxel::kChunkSize << c.level);
         const glm::vec3 min = glm::vec3{c.origin - camBlock} - camFrac; // chunk box, camera at 0
-        const glm::vec3 max = min + kSize;
+        const glm::vec3 max = min + size;
         const glm::vec3 d = (min + max) * 0.5f;
-        if (glm::dot(d, d) > maxDistSq || !frustum.intersects(min, max)) {
+        const f32 maxDist = cullDistance(m_desc.fogDistance, c.level);
+        if (glm::dot(d, d) > maxDist * maxDist || !frustum.intersects(min, max)) {
             continue;
         }
+        // Levels of detail: skip chunks entirely inside their seam (the finer
+        // level covers that); chunks crossing it go to the discard pipeline.
+        bool seam = false;
+        if (const f32 inner = lodInnerRadius(m_desc.lodSeam, c.level); inner > 0.0f) {
+            const glm::vec2 nearest{std::max({min.x, -max.x, 0.0f}), std::max({min.z, -max.z, 0.0f})};
+            const glm::vec2 farthest{std::max(-min.x, max.x), std::max(-min.z, max.z)};
+            if (glm::dot(farthest, farthest) <= inner * inner) {
+                continue;
+            }
+            seam = glm::dot(nearest, nearest) < inner * inner;
+        }
+        u32& count = seam ? counts.seam : counts.interior;
+        VkDrawIndexedIndirectCommand* list = cmds + (seam ? m_maxDraws : 0);
         const u32 drawsBefore = count;
 
         // Face-direction culling: a face can only be seen from in front of
@@ -790,7 +834,7 @@ u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& 
             const u32 first = c.faceStart[f];
             const u32 quads = c.faceStart[end] - first;
             if (quads > 0) {
-                cmds[count++] = VkDrawIndexedIndirectCommand{
+                list[count++] = VkDrawIndexedIndirectCommand{
                     .indexCount = quads * 6,
                     .instanceCount = 1,
                     .firstIndex = 0,
@@ -805,13 +849,18 @@ u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& 
             ++stats.drawnChunks; // counted like the GPU path: only chunks that produced a draw
         }
     }
-    if (count > 0) {
-        VK_CHECK(vmaFlushAllocation(m_ctx.allocator(), frame.indirect.allocation, 0,
-                                    count * sizeof(VkDrawIndexedIndirectCommand)));
+    constexpr VkDeviceSize kCmd = sizeof(VkDrawIndexedIndirectCommand);
+    if (counts.interior > 0) {
+        VK_CHECK(vmaFlushAllocation(m_ctx.allocator(), frame.indirect.allocation, 0, counts.interior * kCmd));
     }
-    stats.draws = count;
+    if (counts.seam > 0) {
+        VK_CHECK(
+            vmaFlushAllocation(m_ctx.allocator(), frame.indirect.allocation, m_maxDraws * kCmd, counts.seam * kCmd));
+    }
+    stats.draws = counts.interior + counts.seam;
+    stats.seamDraws = counts.seam;
     stats.cullMs = std::chrono::duration<f64, std::milli>(std::chrono::steady_clock::now() - start).count();
-    return count;
+    return counts;
 }
 
 f64 Renderer::readGpuTime(u32 frameIndex) const
@@ -835,7 +884,9 @@ FrameStats Renderer::renderFrame(const Camera& camera)
 
     {
         ENGINE_PROFILE_SCOPE("waitForFrameFence");
+        const auto waitStart = std::chrono::steady_clock::now();
         VK_CHECK(vkWaitForFences(device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX));
+        stats.waitMs = std::chrono::duration<f64, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
     }
     if (frame.timestampsWritten) {
         stats.gpuMs = readGpuTime(m_frameIndex);
@@ -861,8 +912,11 @@ FrameStats Renderer::renderFrame(const Camera& camera)
     }
 
     u32 imageIndex = 0;
+    const auto acquireStart = std::chrono::steady_clock::now();
     VkResult acquire = vkAcquireNextImageKHR(device, m_swapchain->handle(), UINT64_MAX, frame.imageAcquired,
                                              VK_NULL_HANDLE, &imageIndex);
+    // Acquiring can block too (until the presentation engine frees an image).
+    stats.waitMs += std::chrono::duration<f64, std::milli>(std::chrono::steady_clock::now() - acquireStart).count();
     if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
         recreateSwapchain();
         return stats; // the semaphore was not signalled; try again next frame
@@ -872,24 +926,27 @@ FrameStats Renderer::renderFrame(const Camera& camera)
     }
     VK_CHECK(vkResetFences(device, 1, &frame.inFlight));
 
-    u32 drawCount = 0;
+    DrawCounts drawCounts;
     if (m_gpuCulling) {
         // Statistics of this slot's previous frame (the GPU is done with it).
         if (frame.countersWritten) {
             VK_CHECK(vmaInvalidateAllocation(m_ctx.allocator(), frame.countersReadback.allocation, 0, VK_WHOLE_SIZE));
             const auto* counters = static_cast<const u32*>(frame.countersReadback.mapped);
-            stats.draws = std::min(counters[0], m_maxDraws);
+            stats.seamDraws = std::min(counters[3], m_maxDraws);
+            stats.draws = std::min(counters[0], m_maxDraws) + stats.seamDraws;
             stats.drawnChunks = counters[1];
             stats.drawnQuads = counters[2];
         }
         stats.gpuCulled = true;
-        drawCount = m_meshes->slotCount() > 0 ? m_maxDraws : 0; // the real count comes from the GPU
+        // The real counts come from the GPU; these are the maximums.
+        const u32 maxDraws = m_meshes->slotCount() > 0 ? m_maxDraws : 0;
+        drawCounts = {maxDraws, m_desc.lodSeam > 0.0f ? maxDraws : 0};
     } else {
-        drawCount = cullAndWriteDraws(frame, camera, stats);
+        drawCounts = cullAndWriteDraws(frame, camera, stats);
     }
 
     const bool screenshot = !m_screenshotPath.empty();
-    stats.uploadedBytes = recordFrame(frame, imageIndex, drawCount, camera, screenshot);
+    stats.uploadedBytes = recordFrame(frame, imageIndex, drawCounts, camera, screenshot);
 
     const VkSemaphoreSubmitInfo waitInfo{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
@@ -945,7 +1002,8 @@ FrameStats Renderer::renderFrame(const Camera& camera)
     return stats;
 }
 
-VkDeviceSize Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Camera& camera, bool screenshot)
+VkDeviceSize Renderer::recordFrame(Frame& frame, u32 imageIndex, DrawCounts draws, const Camera& camera,
+                                   bool screenshot)
 {
     ENGINE_PROFILE_FUNCTION();
     VkCommandBuffer cmd = frame.cmd;
@@ -1011,7 +1069,7 @@ VkDeviceSize Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, 
     vkCmdBeginRendering(cmd, &renderingInfo);
 
     // Every descriptor must be written before drawing (world + textures).
-    if (drawCount > 0 && m_textureImage != VK_NULL_HANDLE) {
+    if (draws.interior + draws.seam > 0 && m_textureImage != VK_NULL_HANDLE) {
         const VkViewport viewport{0.0f, 0.0f, static_cast<f32>(extent.width), static_cast<f32>(extent.height),
                                   0.0f, 1.0f};
         const VkRect2D scissor{{0, 0}, extent};
@@ -1022,21 +1080,33 @@ VkDeviceSize Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, 
         const PushConstants pc{
             .viewProj = camera.projection(aspect) * camera.viewRotation(),
             .cameraBlock = glm::ivec4{camera.cameraBlock(), 0},
-            .cameraFraction = glm::vec4{camera.cameraFraction(), 0.0f},
+            .cameraFraction = glm::vec4{camera.cameraFraction(), m_desc.lodSeam},
             .fog = glm::vec4{kSky[0], kSky[1], kSky[2], m_desc.fogDistance},
         };
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_set, 0, nullptr);
         vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(pc), &pc);
         vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-        // The whole visible world in one call.
-        if (m_gpuCulling) {
-            // As many draws as the culling shader produced (at most drawCount).
-            vkCmdDrawIndexedIndirectCount(cmd, frame.gpuDraws.buffer, 0, frame.counters.buffer, 0, drawCount,
-                                          sizeof(VkDrawIndexedIndirectCommand));
-        } else {
-            vkCmdDrawIndexedIndirect(cmd, frame.indirect.buffer, 0, drawCount, sizeof(VkDrawIndexedIndirectCommand));
+        // The whole visible world in (at most) two calls: chunks clear of any
+        // LOD seam, then the coarse chunks crossing one, which discard the
+        // fragments that the finer level covers.
+        constexpr u32 kStride = sizeof(VkDrawIndexedIndirectCommand);
+        const VkDeviceSize seamOffset = VkDeviceSize{m_maxDraws} * kStride;
+        const std::pair<VkPipeline, u32> lists[] = {{m_pipeline, draws.interior}, {m_seamPipeline, draws.seam}};
+        for (u32 list = 0; list < 2; ++list) {
+            const auto [pipeline, count] = lists[list];
+            if (count == 0) {
+                continue;
+            }
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            if (m_gpuCulling) {
+                // As many draws as the culling shader produced (at most count);
+                // counters[0] counts interior draws, counters[3] seam draws.
+                vkCmdDrawIndexedIndirectCount(cmd, frame.gpuDraws.buffer, list * seamOffset, frame.counters.buffer,
+                                              list * 3 * sizeof(u32), count, kStride);
+            } else {
+                vkCmdDrawIndexedIndirect(cmd, frame.indirect.buffer, list * seamOffset, count, kStride);
+            }
         }
     }
     vkCmdEndRendering(cmd);
