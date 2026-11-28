@@ -105,8 +105,24 @@ std::map<ChunkCoord, std::vector<PackedQuad>> expectedMeshes(ColumnCoord center,
 
 void checkMatches(const MeshSet& set, ColumnCoord center, i32 radius, u32 level = 0)
 {
+    // Exactly the meshes within `radius`, plus possibly some within
+    // radius + 1 (unmeshing has hysteresis), all identical to direct meshing.
     const auto expected = expectedMeshes(center, radius, level);
-    REQUIRE(set.meshes.size() == expected.size());
+    usize extra = 0;
+    for (const auto& [coord, quads] : set.meshes) {
+        if (expected.count(coord) != 0) {
+            continue;
+        }
+        CAPTURE(coord.x);
+        CAPTURE(coord.y);
+        CAPTURE(coord.z);
+        const i64 dx = coord.x - center.x;
+        const i64 dz = coord.z - center.z;
+        REQUIRE(dx * dx + dz * dz <= static_cast<i64>(radius + 1) * (radius + 1));
+        REQUIRE(quads == referenceMesh(coord, level));
+        ++extra;
+    }
+    REQUIRE(set.meshes.size() == expected.size() + extra);
     for (const auto& [coord, quads] : expected) {
         CAPTURE(coord.x);
         CAPTURE(coord.y);
@@ -187,26 +203,48 @@ TEST_CASE("Moving away unloads old columns and reuses their memory")
     checkMatches(set, {0, 0}, 4);
 }
 
-TEST_CASE("Erratic movement never leaves stale or duplicate meshes")
+TEST_CASE("Without keepChunkData, meshed chunks release their voxels and meshes stay correct")
 {
     ThreadPool pool(3);
-    ChunkStreamer streamer(pool, {.viewRadius = 3, .maxJobsInFlight = 5});
+    ChunkStreamer streamer(pool, {.viewRadius = 3, .level = 1, .keepChunkData = false});
     MeshSet set;
-    SplitMix64 rng{42};
-    ColumnCoord center{0, 0};
-    for (int step = 0; step < 300; ++step) {
-        // Mostly small steps (crossing borders), sometimes teleports.
-        if (rng.next() % 20 == 0) {
-            center = {static_cast<i32>(rng.next() % 200) - 100, static_cast<i32>(rng.next() % 200) - 100};
-        } else {
-            center.x += static_cast<i32>(rng.next() % 3) - 1;
-            center.z += static_cast<i32>(rng.next() % 3) - 1;
-        }
-        streamer.update(center);
-        set.apply(streamer.takeMeshEvents());
+    settle(streamer, {2, -1}, set);
+    checkMatches(set, {2, -1}, 3, 1);
+    // Only the generate-only outer ring (not meshed) still holds voxels.
+    ChunkStreamer keeping(pool, {.viewRadius = 3, .level = 1});
+    MeshSet other;
+    settle(keeping, {2, -1}, other);
+    CHECK(streamer.stats().storedChunks < keeping.stats().storedChunks);
+    // Moving back and forth re-meshes released columns by regenerating them.
+    for (const ColumnCoord c : {ColumnCoord{12, -1}, ColumnCoord{2, -1}, ColumnCoord{3, 0}, ColumnCoord{2, -1}}) {
+        settle(streamer, c, set);
+        checkMatches(set, c, 3, 1);
     }
-    settle(streamer, center, set);
-    checkMatches(set, center, 3);
+}
+
+TEST_CASE("Erratic movement never leaves stale or duplicate meshes")
+{
+    for (const bool keep : {true, false}) {
+        CAPTURE(keep);
+        ThreadPool pool(3);
+        ChunkStreamer streamer(pool, {.viewRadius = 3, .maxJobsInFlight = 5, .keepChunkData = keep});
+        MeshSet set;
+        SplitMix64 rng{42};
+        ColumnCoord center{0, 0};
+        for (int step = 0; step < 300; ++step) {
+            // Mostly small steps (crossing borders), sometimes teleports.
+            if (rng.next() % 20 == 0) {
+                center = {static_cast<i32>(rng.next() % 200) - 100, static_cast<i32>(rng.next() % 200) - 100};
+            } else {
+                center.x += static_cast<i32>(rng.next() % 3) - 1;
+                center.z += static_cast<i32>(rng.next() % 3) - 1;
+            }
+            streamer.update(center);
+            set.apply(streamer.takeMeshEvents());
+        }
+        settle(streamer, center, set);
+        checkMatches(set, center, 3);
+    }
 }
 
 TEST_CASE("Destroying a streamer with jobs in flight is safe")

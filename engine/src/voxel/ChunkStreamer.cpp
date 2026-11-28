@@ -128,6 +128,16 @@ ChunkStreamer::Column* ChunkStreamer::find(ColumnCoord coord)
     return it != m_columns.end() ? &it->second : nullptr;
 }
 
+bool ChunkStreamer::isStale(const Column& col) noexcept
+{
+    if (!col.dataDropped) {
+        return false;
+    }
+    return std::ranges::any_of(col.chunks, [](const ChunkState& cs) {
+        return !cs.meshed && !cs.meshing && cs.content == ChunkContent::Mixed && cs.data == nullptr;
+    });
+}
+
 i64 ChunkStreamer::distanceSq(ColumnCoord coord) const noexcept
 {
     const i64 dx = coord.x - m_center.x;
@@ -234,6 +244,13 @@ void ChunkStreamer::complete(Completion&& c)
         return;
     }
     cs.meshed = true;
+    if (!m_options.keepChunkData && cs.data != nullptr) {
+        // Its neighbours mesh against its outer layers, which are kept.
+        m_chunkPool.release(cs.data);
+        cs.data = nullptr;
+        --m_stored;
+        column->dataDropped = true;
+    }
     if (!c.quads.empty()) {
         cs.hasMesh = true;
         ++m_meshed;
@@ -251,7 +268,11 @@ void ChunkStreamer::unloadFar()
     for (auto it = m_columns.begin(); it != m_columns.end();) {
         Column& col = it->second;
         const i64 d2 = distanceSq(col.coord);
-        if (d2 <= unmesh * unmesh) {
+        // A column that released voxels cannot be meshed again: once it needs
+        // to be (it was unmeshed or a mesh was abandoned), drop it entirely
+        // and let it be generated afresh.
+        const bool stale = isStale(col);
+        if (d2 <= unmesh * unmesh && !stale) {
             ++it;
             continue;
         }
@@ -267,7 +288,7 @@ void ChunkStreamer::unloadFar()
             meshing |= cs.meshing;
         }
         col.allMeshed = false;
-        if (d2 > unload * unload && col.state == State::Ready && !meshing) {
+        if ((d2 > unload * unload || col.dataDropped) && col.state == State::Ready && !meshing) {
             for (ChunkState& cs : col.chunks) {
                 if (cs.data != nullptr) {
                     m_chunkPool.release(cs.data);
@@ -314,6 +335,10 @@ void ChunkStreamer::schedule()
         }
         if (col->allMeshed || static_cast<i64>(dx) * dx + static_cast<i64>(dz) * dz > meshRadiusSq) {
             continue; // done, or in the generate-only outer ring
+        }
+        if (isStale(*col)) {
+            workLeft = true; // stale (see unloadFar): unloaded once its jobs finish, then regenerated
+            continue;
         }
         bool neighboursReady = true; // all 8 surrounding columns (ambient occlusion needs the diagonals)
         for (i32 nz = -1; nz <= 1; ++nz) {
