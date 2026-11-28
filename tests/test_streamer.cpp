@@ -121,10 +121,12 @@ void checkMatches(const MeshSet& set, ColumnCoord center, i32 radius)
 
 TEST_CASE("Coordinates: columnAt floors, chunk keys are unique")
 {
-    CHECK(columnAt(0.0f, 0.0f) == ColumnCoord{0, 0});
-    CHECK(columnAt(31.9f, 32.0f) == ColumnCoord{0, 1});
-    CHECK(columnAt(-0.1f, -32.0f) == ColumnCoord{-1, -1});
-    CHECK(columnAt(-32.1f, 5.0f) == ColumnCoord{-2, 0});
+    CHECK(columnAt(0.0, 0.0) == ColumnCoord{0, 0});
+    CHECK(columnAt(31.9, 32.0) == ColumnCoord{0, 1});
+    CHECK(columnAt(-0.1, -32.0) == ColumnCoord{-1, -1});
+    CHECK(columnAt(-32.1, 5.0) == ColumnCoord{-2, 0});
+    // Far from the origin (double precision): 1,000,000 / 32 = 31250 exactly.
+    CHECK(columnAt(1'000'000.0 - 0.001, 1'000'000.0) == ColumnCoord{31249, 31250});
     std::set<u64> keys;
     for (i32 x : {-2, -1, 0, 1, 2}) {
         for (i32 y : {-1, 0, 1, 3}) {

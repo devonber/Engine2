@@ -5,6 +5,7 @@
 #include "engine/render/Camera.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -33,8 +34,9 @@ constexpr u32 kMaxQuadsPerChunk = voxel::kChunkVolume / 2 * 6;
 constexpr f32 kSky[3] = {0.36f, 0.58f, 0.92f};
 
 struct PushConstants {
-    glm::mat4 viewProj;
-    glm::vec4 cameraPos;
+    glm::mat4 viewProj;       // projection * rotation only: the camera is at the origin
+    glm::ivec4 cameraBlock;   // xyz: integer block containing the camera
+    glm::vec4 cameraFraction; // xyz: camera position within that block
     glm::vec4 fog;
 };
 static_assert(sizeof(PushConstants) <= 128, "128 bytes is the guaranteed minimum push constant size");
@@ -188,7 +190,8 @@ Renderer::Renderer(VulkanContext& ctx, platform::Window& window, const RendererD
         const VkSemaphoreCreateInfo semInfo{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VK_CHECK(vkCreateSemaphore(device, &semInfo, nullptr, &f.imageAcquired));
         // Worst case: every resident chunk visible.
-        f.indirect = createBuffer(m_ctx.allocator(), desc.maxChunks * sizeof(VkDrawIndexedIndirectCommand),
+        // Up to 3 draws per chunk (runs of face directions facing the camera).
+        f.indirect = createBuffer(m_ctx.allocator(), desc.maxChunks * 3 * sizeof(VkDrawIndexedIndirectCommand),
                                   VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, MemoryKind::Upload);
     }
 
@@ -392,7 +395,7 @@ void Renderer::removeChunkMesh(u64 key)
 MeshMemoryStats Renderer::meshStats() const
 {
     const ChunkMeshStore::Stats s = m_meshes->stats();
-    return {s.chunks, s.quads, s.usedBytes, s.capacityBytes, s.pendingBytes, s.failed};
+    return {s.chunks, s.quads, s.usedBytes, s.capacityBytes, s.pendingBytes, s.failed, s.grows};
 }
 
 void Renderer::destroyTextures()
@@ -529,13 +532,17 @@ void Renderer::recreateSwapchain()
     }
 }
 
-u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, u64& drawnQuads) const
+u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& stats) const
 {
     ENGINE_PROFILE_FUNCTION();
+    const auto start = std::chrono::steady_clock::now();
     const VkExtent2D extent = m_swapchain->extent();
     const f32 aspect = static_cast<f32>(extent.width) / static_cast<f32>(extent.height);
-    const Frustum frustum = Frustum::fromViewProj(camera.projection(aspect) * camera.view());
+    // Everything here is relative to the camera, like the vertex shader.
+    const Frustum frustum = Frustum::fromViewProj(camera.projection(aspect) * camera.viewRotation());
     const f32 maxDistSq = (m_desc.fogDistance + 56.0f) * (m_desc.fogDistance + 56.0f); // fully fogged beyond
+    const glm::ivec3 camBlock = camera.cameraBlock();
+    const glm::vec3 camFrac = camera.cameraFraction();
 
     auto* cmds = static_cast<VkDrawIndexedIndirectCommand*>(frame.indirect.mapped);
     u32 count = 0;
@@ -546,25 +553,56 @@ u32 Renderer::cullAndWriteDraws(Frame& frame, const Camera& camera, u64& drawnQu
         if (!c.drawable || c.quadCount == 0) {
             continue;
         }
-        const glm::vec3 min{c.origin};
+        const glm::vec3 min = glm::vec3{c.origin - camBlock} - camFrac; // chunk box, camera at 0
         const glm::vec3 max = min + kSize;
-        const glm::vec3 d = (min + max) * 0.5f - camera.position;
+        const glm::vec3 d = (min + max) * 0.5f;
         if (glm::dot(d, d) > maxDistSq || !frustum.intersects(min, max)) {
             continue;
         }
-        cmds[count++] = VkDrawIndexedIndirectCommand{
-            .indexCount = c.quadCount * 6,
-            .instanceCount = 1,
-            .firstIndex = 0,
-            .vertexOffset = static_cast<i32>(c.firstQuad * 4),
-            .firstInstance = i, // slot index: selects the chunk origin in the shader
+        ++stats.drawnChunks;
+
+        // Face-direction culling: a face can only be seen from in front of
+        // its plane. +X faces lie on planes from min.x + 1 to max.x, so none
+        // is visible unless the camera (at 0) is beyond min.x; likewise for
+        // the others. Each chunk's quads are grouped by direction
+        // (PosX, NegX, PosY, NegY, PosZ, NegZ), so visible directions form at
+        // most 3 contiguous runs: one draw each.
+        const bool all = !m_desc.faceCulling;
+        const bool visible[voxel::kFaceCount] = {
+            all || min.x < 0.0f, all || max.x > 0.0f, // +X, -X
+            all || min.y < 0.0f, all || max.y > 0.0f, // +Y, -Y
+            all || min.z < 0.0f, all || max.z > 0.0f, // +Z, -Z
         };
-        drawnQuads += c.quadCount;
+        for (u32 f = 0; f < voxel::kFaceCount;) {
+            if (!visible[f]) {
+                ++f;
+                continue;
+            }
+            u32 end = f + 1;
+            while (end < voxel::kFaceCount && visible[end]) {
+                ++end;
+            }
+            const u32 first = c.faceStart[f];
+            const u32 quads = c.faceStart[end] - first;
+            if (quads > 0) {
+                cmds[count++] = VkDrawIndexedIndirectCommand{
+                    .indexCount = quads * 6,
+                    .instanceCount = 1,
+                    .firstIndex = 0,
+                    .vertexOffset = static_cast<i32>((c.firstQuad + first) * 4),
+                    .firstInstance = i, // slot index: selects the chunk origin in the shader
+                };
+                stats.drawnQuads += quads;
+            }
+            f = end;
+        }
     }
     if (count > 0) {
         VK_CHECK(vmaFlushAllocation(m_ctx.allocator(), frame.indirect.allocation, 0,
                                     count * sizeof(VkDrawIndexedIndirectCommand)));
     }
+    stats.draws = count;
+    stats.cullMs = std::chrono::duration<f64, std::milli>(std::chrono::steady_clock::now() - start).count();
     return count;
 }
 
@@ -595,6 +633,20 @@ FrameStats Renderer::renderFrame(const Camera& camera)
         stats.gpuMs = readGpuTime(m_frameIndex);
     }
     m_meshes->beginFrame(m_frameIndex); // the GPU is done with what this frame slot last used
+    if (m_meshes->consumeBufferChanged()) {
+        // The quad buffer grew (in setChunkMesh, which waited for the GPU, so
+        // no submitted work still uses this descriptor).
+        const VkDescriptorBufferInfo quadInfo{m_meshes->quadBuffer(), 0, VK_WHOLE_SIZE};
+        const VkWriteDescriptorSet write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = m_set,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &quadInfo,
+        };
+        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    }
 
     if (m_window.consumeResized()) {
         recreateSwapchain();
@@ -612,10 +664,7 @@ FrameStats Renderer::renderFrame(const Camera& camera)
     }
     VK_CHECK(vkResetFences(device, 1, &frame.inFlight));
 
-    u64 drawnQuads = 0;
-    const u32 drawCount = cullAndWriteDraws(frame, camera, drawnQuads);
-    stats.drawnChunks = drawCount;
-    stats.drawnQuads = drawnQuads;
+    const u32 drawCount = cullAndWriteDraws(frame, camera, stats);
 
     const bool screenshot = !m_screenshotPath.empty();
     stats.uploadedBytes = recordFrame(frame, imageIndex, drawCount, camera, screenshot);
@@ -745,8 +794,9 @@ VkDeviceSize Renderer::recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, 
 
         const f32 aspect = static_cast<f32>(extent.width) / static_cast<f32>(extent.height);
         const PushConstants pc{
-            .viewProj = camera.projection(aspect) * camera.view(),
-            .cameraPos = glm::vec4{camera.position, 0.0f},
+            .viewProj = camera.projection(aspect) * camera.viewRotation(),
+            .cameraBlock = glm::ivec4{camera.cameraBlock(), 0},
+            .cameraFraction = glm::vec4{camera.cameraFraction(), 0.0f},
             .fog = glm::vec4{kSky[0], kSky[1], kSky[2], m_desc.fogDistance},
         };
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);

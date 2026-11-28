@@ -53,9 +53,9 @@ bool allSolid(const BoundaryMasks& masks) noexcept
 
 } // namespace
 
-ColumnCoord columnAt(f32 worldX, f32 worldZ) noexcept
+ColumnCoord columnAt(f64 worldX, f64 worldZ) noexcept
 {
-    constexpr f32 size = static_cast<f32>(kChunkSize);
+    constexpr f64 size = static_cast<f64>(kChunkSize);
     return {static_cast<i32>(std::floor(worldX / size)), static_cast<i32>(std::floor(worldZ / size))};
 }
 

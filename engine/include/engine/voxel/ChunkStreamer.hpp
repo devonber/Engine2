@@ -45,7 +45,7 @@ struct ChunkCoord {
 };
 
 // Column containing a world-space position (floor division, so -0.5 is column -1).
-[[nodiscard]] ColumnCoord columnAt(f32 worldX, f32 worldZ) noexcept;
+[[nodiscard]] ColumnCoord columnAt(f64 worldX, f64 worldZ) noexcept;
 
 // Recycles chunk storage. Chunks are 64 KiB; fresh allocations page-fault on
 // first touch, which is slow (and serialised per process on Windows), so

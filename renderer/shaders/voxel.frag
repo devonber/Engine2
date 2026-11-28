@@ -2,7 +2,8 @@
 
 layout(push_constant) uniform PushConstants {
     mat4 viewProj;
-    vec4 cameraPos;
+    ivec4 cameraBlock;
+    vec4 cameraFraction;
     vec4 fog; // rgb = colour (linear), a = distance of full fog
 } pc;
 
