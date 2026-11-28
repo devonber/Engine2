@@ -36,7 +36,7 @@ const vec3 kV[6]    = vec3[6](vec3(0, 0, 1), vec3(0, 1, 0), vec3(1, 0, 0), vec3(
 const float kShade[6] = float[6](0.80, 0.80, 1.00, 0.50, 0.65, 0.65);
 
 // Texture coordinates from the corner's position relative to the quad's first
-// block (0..width / 0..height). The sampler repeats, so a merged quad shows one
+// block (0..width / 0..height). The fragment shader wraps it per block, so a merged quad shows one
 // texture tile per block, exactly like separate faces. Side faces put the texture's top edge at the block's top and
 // read left-to-right when seen from outside; top/bottom faces map x/z.
 vec2 faceUV(uint face, vec3 o)

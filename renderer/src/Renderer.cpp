@@ -479,9 +479,11 @@ void Renderer::setBlockTextures(const BlockTextureSet& set)
         .magFilter = VK_FILTER_NEAREST,
         .minFilter = VK_FILTER_LINEAR,
         .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        // Clamp: tiling across merged quads is done in the shader (fract), and
+        // REPEAT would bleed each texture's opposite edge into block borders.
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
         .anisotropyEnable = aniso ? VK_TRUE : VK_FALSE,
         .maxAnisotropy = aniso ? std::min(16.0f, m_ctx.properties().limits.maxSamplerAnisotropy) : 1.0f,
         .maxLod = VK_LOD_CLAMP_NONE,
