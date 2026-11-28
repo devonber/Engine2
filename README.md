@@ -101,6 +101,15 @@ Vulkan 1.3, written for throughput:
   with a tiny depth offset in its favour. Only coarse chunks that cross a seam use the discarding
   pipeline; chunks entirely inside the seam are culled. Coarse levels release each chunk's voxels as
   soon as it is meshed (only the mesh and its outer layers are kept), so memory stays small.
+- **Lighting**: a sun (or moon) on a day/night path, hemisphere sky light from above with ground bounce
+  from below, darkened by the ambient occlusion, and direct light with **cascaded shadow maps**
+  (4 x 2048^2, 16-bit, up to 256 blocks; bounding-sphere cascades snapped to whole texels so shadows
+  neither change size when turning nor crawl when moving; normal-offset lookups and 4-tap hardware PCF).
+  Shadow casters are culled per cascade by the same compute shader (faces towards the light only).
+  The sky, fog and clear colour follow the sun. `--time H`, `--day-length S`, hold T to advance time,
+  `--no-shadows`.
+- **No pinholes**: greedy-merged quads meet at T-junctions, where rasterisation can leave single pixels
+  uncovered; the vertex shader grows each quad by a fraction of a pixel within its plane to close them.
 - **Explicit AVX2** in the hot loops (voxel bitmasks, terrain layers, face masks), with plain C++
   fallbacks, so speed does not depend on what a compiler's auto-vectoriser happens to do.
 - **One draw call for the whole world**: every visible chunk's draws are indirect commands in one buffer.
@@ -114,11 +123,12 @@ Vulkan 1.3, written for throughput:
 - Shaders are compiled at build time and embedded in the executable.
 
 Sandbox controls: left-click to capture the mouse, Esc to release; WASD to move, Space/Shift for
-up/down, Ctrl for speed. Frame rate, CPU and GPU times are shown in the title bar.
+up/down, Ctrl for speed, hold T to advance the time of day. Frame rate, CPU and GPU times are shown in the title bar.
 
 Sandbox options: `--radius N` (view distance in chunks, default 96, up to 1024), `--detail-radius N`
 (radius of each level of detail, default 12), `--lod-levels N` (force a number of levels; 1 = full detail
-only, radius up to 128), `--vsync`, `--validation` / `--no-validation`,
+only, radius up to 128), `--time H` (hours, default 10), `--day-length S` (seconds per day; default: time stands still),
+`--no-shadows`, `--vsync`, `--validation` / `--no-validation`,
 `--camera x,y,z,yawDeg,pitchDeg`, `--assets DIR`, `--mesher greedy|binary`, `--no-ao`, `--no-face-culling`, `--cpu-culling`, `--mesh-memory MiB`, `--threads N`,
 `--fly SPEED` (fly forward automatically, blocks/s), `--frames N` (quit N frames after the initial area
 has loaded), `--screenshot file.bmp`. The title bar shows frame, CPU (excluding time blocked on the

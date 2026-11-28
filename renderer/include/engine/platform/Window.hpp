@@ -9,7 +9,7 @@ struct GLFWwindow;
 
 namespace engine::platform {
 
-enum class Key { W, A, S, D, Space, LeftShift, LeftControl, Escape, Count };
+enum class Key { W, A, S, D, Space, LeftShift, LeftControl, Escape, T, Count };
 
 struct InputState {
     bool keys[static_cast<usize>(Key::Count)] = {};

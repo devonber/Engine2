@@ -4,6 +4,11 @@
 // three indexed-indirect draws (runs of face directions that can face the
 // camera); vkCmdDrawIndexedIndirectCount then draws exactly that many. The
 // tests match Renderer::cullAndWriteDraws (the CPU path).
+//
+// Dispatched once for the camera (cameraBlock.w = 0) and once per shadow
+// cascade (cameraBlock.w = 1 + cascade): then the planes are the cascade's
+// box, only full-detail chunks count, and the face directions drawn are a
+// fixed mask (those facing the light).
 
 layout(local_size_x = 64) in;
 
@@ -28,13 +33,15 @@ layout(std430, set = 0, binding = 2) buffer Counters {
     uint chunkCount;
     uint quadCount;
     uint seamDrawCount; // read by the seam draw (draws[maxDraws + i])
+    uint shadowDrawCount[4]; // per shadow cascade
 };
 
 layout(push_constant) uniform PushConstants {
-    ivec4 cameraBlock;    // xyz: integer block containing the camera
+    ivec4 cameraBlock;    // xyz: integer block containing the camera; w: 0 camera, 1 + cascade for shadows
     vec4 cameraFraction;  // xyz: camera position within it; w: fog distance
     vec4 planes[5];       // camera-relative frustum (left, right, bottom, top, near)
-    uvec4 params;         // x: slot count, y: face culling on, z: capacity of each draw list, w: LOD seam (float bits)
+    uvec4 params;         // x: slot count, y: face culling on (camera) / face mask (shadows),
+                          // z: capacity of the draw list(s), w: LOD seam (float bits; camera) / list offset (shadows)
 } pc;
 
 void main()
@@ -49,13 +56,17 @@ void main()
     }
     const uint level = c.faces1.w >> 1;
     const float scale = float(1u << level);
+    const uint pass = uint(pc.cameraBlock.w);
+    if (pass != 0u && level != 0u) {
+        return; // only full-detail chunks cast shadows
+    }
 
     // Chunk box relative to the camera (integer part exact).
     const vec3 lo = vec3(c.originFirst.xyz - pc.cameraBlock.xyz) - pc.cameraFraction.xyz;
     const vec3 hi = lo + 32.0 * scale;
     const vec3 centre = (lo + hi) * 0.5;
     const float maxDist = pc.cameraFraction.w + 56.0 * scale;
-    if (dot(centre, centre) > maxDist * maxDist) {
+    if (pass == 0u && dot(centre, centre) > maxDist * maxDist) {
         return; // fully fogged
     }
     for (int i = 0; i < 5; ++i) {
@@ -71,7 +82,7 @@ void main()
     // level covers that); chunks crossing it go to the seam list, drawn with
     // the pipeline that discards the covered fragments.
     bool seam = false;
-    const float inner = level == 0u ? 0.0 : uintBitsToFloat(pc.params.w) * float(1u << (level - 1u));
+    const float inner = (level == 0u || pass != 0u) ? 0.0 : uintBitsToFloat(pc.params.w) * float(1u << (level - 1u));
     if (inner > 0.0) {
         const vec2 nearest = vec2(max(max(lo.x, -hi.x), 0.0), max(max(lo.z, -hi.z), 0.0));
         const vec2 farthest = vec2(max(-lo.x, hi.x), max(-lo.z, hi.z));
@@ -82,10 +93,16 @@ void main()
     }
 
     // Face directions that can face the camera (camera at the origin).
+    // For shadows: the directions in the mask.
     const bool all = pc.params.y == 0u;
-    const bool visible[6] = bool[6](all || lo.x < 0.0, all || hi.x > 0.0,  // +X, -X
-                                    all || lo.y < 0.0, all || hi.y > 0.0,  // +Y, -Y
-                                    all || lo.z < 0.0, all || hi.z > 0.0); // +Z, -Z
+    bool visible[6] = bool[6](all || lo.x < 0.0, all || hi.x > 0.0,  // +X, -X
+                              all || lo.y < 0.0, all || hi.y > 0.0,  // +Y, -Y
+                              all || lo.z < 0.0, all || hi.z > 0.0); // +Z, -Z
+    if (pass != 0u) {
+        for (uint i = 0u; i < 6u; ++i) {
+            visible[i] = ((pc.params.y >> i) & 1u) != 0u;
+        }
+    }
     const uint start[7] = uint[7](c.faces0.x, c.faces0.y, c.faces0.z, c.faces0.w, c.faces1.x, c.faces1.y, c.faces1.z);
 
     // Contiguous runs of visible directions: at most 3.
@@ -116,10 +133,17 @@ void main()
         return;
     }
 
-    const uint base = seam ? atomicAdd(seamDrawCount, runs) : atomicAdd(drawCount, runs);
-    const uint list = seam ? pc.params.z : 0u;
-    atomicAdd(chunkCount, 1u);
-    atomicAdd(quadCount, quads);
+    uint base;
+    uint list;
+    if (pass != 0u) {
+        base = atomicAdd(shadowDrawCount[pass - 1u], runs);
+        list = pc.params.w;
+    } else {
+        base = seam ? atomicAdd(seamDrawCount, runs) : atomicAdd(drawCount, runs);
+        list = seam ? pc.params.z : 0u;
+        atomicAdd(chunkCount, 1u);
+        atomicAdd(quadCount, quads);
+    }
     for (uint r = 0u; r < runs; ++r) {
         if (base + r < pc.params.z) { // the draw count is also clamped when drawing
             draws[list + base + r] =

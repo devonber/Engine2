@@ -9,6 +9,9 @@
 //                             full detail this far, then 2x coarser voxels for each doubling
 //           --lod-levels N    force N levels of detail (default: as many as --radius needs);
 //                             1 = full detail all the way (radius up to 128)
+//           --time H          time of day in hours (default 10; 12 = noon, night ~19-5); hold T to advance it
+//           --day-length S    seconds per in-game day (default 0: the time stands still)
+//           --no-shadows      sun/moon light without shadows
 //           --vsync           cap to display refresh (default: uncapped)
 //           --validation      force the Vulkan validation layer on (always on in Debug)
 //           --no-validation   force it off
@@ -30,11 +33,13 @@
 #include "engine/render/BlockTextures.hpp"
 #include "engine/render/Camera.hpp"
 #include "engine/render/Renderer.hpp"
+#include "engine/render/Sky.hpp"
 #include "engine/voxel/Blocks.hpp"
 #include "engine/voxel/ChunkStreamer.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,6 +55,9 @@ namespace {
 
 struct Options {
     i32 radius = 96;
+    f32 timeOfDay = 10.0f;
+    f32 dayLength = 0.0f;
+    bool shadows = true;
     i32 detailRadius = 12;
     u32 lodLevels = 0; // 0 = automatic
     bool vsync = false;
@@ -79,6 +87,12 @@ Options parseArgs(int argc, char** argv)
             o.detailRadius = std::clamp(std::atoi(next()), 4, 96);
         } else if (arg("--lod-levels")) {
             o.lodLevels = static_cast<u32>(std::clamp(std::atoi(next()), 1, static_cast<int>(voxel::kMaxLodLevels)));
+        } else if (arg("--time")) {
+            o.timeOfDay = std::fmod(std::fmod(static_cast<f32>(std::atof(next())), 24.0f) + 24.0f, 24.0f);
+        } else if (arg("--day-length")) {
+            o.dayLength = std::max(0.0f, static_cast<f32>(std::atof(next())));
+        } else if (arg("--no-shadows")) {
+            o.shadows = false;
         } else if (arg("--vsync")) {
             o.vsync = true;
         } else if (arg("--validation")) {
@@ -216,7 +230,10 @@ int main(int argc, char** argv)
                                   .faceCulling = opt.faceCulling,
                                   .gpuCulling = opt.gpuCulling,
                                   .lodSeam = plan.lodSeam,
+                                  .shadows = opt.shadows,
                               });
+    f32 timeOfDay = opt.timeOfDay;
+    renderer.setSun(render::sunDirectionAt(timeOfDay));
 
     using Clock = std::chrono::steady_clock;
     {
@@ -301,6 +318,13 @@ int main(int argc, char** argv)
         last = now;
 
         updateCamera(camera, window.input(), dt);
+        // Time of day: runs with --day-length; T fast-forwards (an hour per second).
+        const f32 hoursPerSecond = (opt.dayLength > 0.0f ? 24.0f / opt.dayLength : 0.0f) +
+                                   (window.input().down(platform::Key::T) ? 1.0f : 0.0f);
+        if (hoursPerSecond > 0.0f) {
+            timeOfDay = std::fmod(timeOfDay + hoursPerSecond * dt, 24.0f);
+            renderer.setSun(render::sunDirectionAt(timeOfDay));
+        }
         if (loaded && opt.fly > 0.0f) {
             const glm::vec3 flat = glm::normalize(glm::vec3{std::sin(camera.yaw), 0.0f, -std::cos(camera.yaw)});
             camera.position += glm::dvec3{flat * opt.fly * dt};
@@ -361,13 +385,14 @@ int main(int argc, char** argv)
             // render cpu excludes waiting for the GPU (shown separately as wait).
             const std::string title = std::format(
                 "Engine2 | {:.0f} fps | render cpu {:.2f} ms (cpu cull {:.2f}), wait {:.2f} ms | gpu {:.2f} ms | "
-                "stream {:.2f} ms | {} chunks, {} draws ({} seam), {:.2f}M quads | {} meshed, {} jobs, {:.1f} MB/s up, "
-                "mesh mem {:.0f}/{:.0f} MiB",
+                "stream {:.2f} ms | {} chunks, {} draws ({} seam, {} shadow), {:.2f}M quads | {} meshed, {} jobs, "
+                "{:.1f} MB/s up, mesh mem {:.0f}/{:.0f} MiB | {:02d}:{:02d}",
                 statFrames / elapsed, cpuAccumMs / statFrames, cullAccumMs / statFrames, waitAccumMs / statFrames,
                 gpuAccumMs / statFrames, streamAccumMs / statFrames, stats.drawnChunks, stats.draws, stats.seamDraws,
-                static_cast<f64>(stats.drawnQuads) / 1e6, ss.meshedChunks, ss.jobsInFlight,
+                stats.shadowDraws, static_cast<f64>(stats.drawnQuads) / 1e6, ss.meshedChunks, ss.jobsInFlight,
                 static_cast<f64>(uploadAccum) / elapsed / 1e6, static_cast<f64>(ms.usedBytes) / (1024.0 * 1024.0),
-                static_cast<f64>(ms.capacityBytes) / (1024.0 * 1024.0));
+                static_cast<f64>(ms.capacityBytes) / (1024.0 * 1024.0), static_cast<int>(timeOfDay),
+                static_cast<int>(std::fmod(timeOfDay, 1.0f) * 60.0f));
             window.setTitle(title.c_str());
             if (opt.frames >= 0) {
                 std::fprintf(stderr, "%s\n", title.c_str());
