@@ -83,6 +83,23 @@ struct BoundaryMasks {
 
 [[nodiscard]] BoundaryMasks buildBoundaryMasks(const ChunkNeighbours& neighbours);
 
+// Solidity of a chunk's OWN six outer layers, indexed by face: rows[PosX] is
+// its x = 31 layer, rows[NegX] its x = 0 layer, and so on, with the same
+// (row, col) layout as BoundaryMasks. Compute it once, right after generating
+// the chunk while its data is in cache (~2 us); meshing a neighbour then
+// copies 128 bytes instead of reading the whole neighbour from memory.
+struct OuterLayers {
+    std::array<std::array<u32, kChunkSize>, kFaceCount> rows{};
+};
+
+[[nodiscard]] OuterLayers computeOuterLayers(const Chunk& chunk);
+
+// Boundary masks of a chunk from its neighbours' outer layers, indexed by
+// Face (nullptr = air). The neighbour on side f touches with its opposite
+// layer (f ^ 1): the +X neighbour's x = 0 layer, etc.
+[[nodiscard]] BoundaryMasks
+boundaryFromNeighbours(const std::array<const OuterLayers*, kFaceCount>& neighbours) noexcept;
+
 // All meshers emit faces of solid blocks whose neighbour is air, including
 // across chunk borders (using the neighbours). `out` is cleared and
 // refilled; reuse the same vector between calls so it allocates once.

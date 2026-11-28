@@ -69,33 +69,37 @@ WorldMesh buildTerrainWorld(const WorldBuildOptions& options, ThreadPool* pool)
     // fill per chunk (fillTerrain writes every voxel), and each thread takes
     // the first-touch page faults for its own chunks instead of one thread for all.
     const ChunkArray chunks(count);
+    std::vector<OuterLayers> outer(count);
     forEach(pool, count, [&](u32 i) {
         const auto [cx, cz] = coords(i);
         Chunk* chunk = std::construct_at(&chunks[i], Chunk::Uninitialized{});
         fillTerrain(*chunk, cx, cz);
+        outer[i] = computeOuterLayers(*chunk); // while the chunk is in cache
     });
     world.generateMs = msSince(start);
 
-    // Phase 2: mesh every chunk against its (now read-only) neighbours. Each
+    // Phase 2: mesh every chunk against its neighbours' outer layers. Each
     // chunk writes its own vector, so the result does not depend on timing.
     start = std::chrono::steady_clock::now();
-    const auto at = [&](i32 cx, i32 cz) -> const Chunk* {
+    const auto at = [&](i32 cx, i32 cz) -> const OuterLayers* {
         if (cx < -radius || cx >= radius || cz < -radius || cz >= radius) {
             return nullptr; // outside the world: air
         }
-        return &chunks[static_cast<usize>((cz + radius) * side + (cx + radius))];
+        return &outer[static_cast<usize>((cz + radius) * side + (cx + radius))];
     };
     std::vector<std::vector<PackedQuad>> perChunk(count);
     forEach(pool, count, [&](u32 i) {
         const auto [cx, cz] = coords(i);
         BoundaryMasks masks;
         if (options.borderCulling) {
-            ChunkNeighbours nb;
-            nb.chunks[static_cast<usize>(Face::PosX)] = at(cx + 1, cz);
-            nb.chunks[static_cast<usize>(Face::NegX)] = at(cx - 1, cz);
-            nb.chunks[static_cast<usize>(Face::PosZ)] = at(cx, cz + 1);
-            nb.chunks[static_cast<usize>(Face::NegZ)] = at(cx, cz - 1);
-            masks = buildBoundaryMasks(nb);
+            // Neighbours' outer layers, not the neighbour chunks themselves
+            // (which would be cold in cache).
+            std::array<const OuterLayers*, kFaceCount> nb{};
+            nb[static_cast<usize>(Face::PosX)] = at(cx + 1, cz);
+            nb[static_cast<usize>(Face::NegX)] = at(cx - 1, cz);
+            nb[static_cast<usize>(Face::PosZ)] = at(cx, cz + 1);
+            nb[static_cast<usize>(Face::NegZ)] = at(cx, cz - 1);
+            masks = boundaryFromNeighbours(nb);
             masks.setSolid(Face::NegY); // nothing is ever seen below the world
         }
         // Mesh into a per-thread scratch buffer whose capacity survives between

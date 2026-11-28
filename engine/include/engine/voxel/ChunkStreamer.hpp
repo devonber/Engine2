@@ -112,13 +112,14 @@ private:
         State state = State::Generating;
         bool meshing = false; // mesh job in flight
         bool meshed = false;  // renderer has (or is about to get) a mesh
-        u16 pins = 0;         // mesh jobs reading this chunk (as itself or a neighbour)
+        OuterLayers outer;    // solidity of the chunk's own outer layers (valid once Ready)
     };
 
     struct Completion {
         ChunkCoord coord;
         bool isMesh = false;
-        std::vector<PackedQuad> quads;
+        std::vector<PackedQuad> quads; // mesh jobs
+        OuterLayers outer;             // generate jobs
     };
 
     void collectCompletions();

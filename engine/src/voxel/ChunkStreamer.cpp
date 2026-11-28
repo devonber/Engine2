@@ -15,7 +15,7 @@ namespace {
 
 constexpr std::align_val_t kChunkAlign{64};
 
-// Horizontal neighbours, in ChunkNeighbours face order.
+// Horizontal neighbours.
 constexpr std::pair<Face, std::pair<i32, i32>> kSideNeighbours[] = {
     {Face::PosX, {+1, 0}},
     {Face::NegX, {-1, 0}},
@@ -113,7 +113,7 @@ void ChunkStreamer::update(ChunkCoord center)
 
     if (moved || completed) {
         m_settled = false;
-        unloadFar(); // completions release pins, which may unblock unloading
+        unloadFar(); // finished jobs may unblock unloading of their chunks
     }
     if (!m_settled) {
         schedule();
@@ -149,16 +149,11 @@ void ChunkStreamer::complete(Completion&& c)
     ENGINE_ASSERT(entry != nullptr); // in-flight chunks are never unloaded
     if (!c.isMesh) {
         entry->state = State::Ready;
+        entry->outer = c.outer;
         return;
     }
 
     entry->meshing = false;
-    --entry->pins;
-    for (const auto& [face, d] : kSideNeighbours) {
-        Entry* n = find({c.coord.x + d.first, c.coord.z + d.second});
-        ENGINE_ASSERT(n != nullptr && n->pins > 0);
-        --n->pins;
-    }
 
     // The player may have moved on while this was meshing.
     const i64 keep = m_options.viewRadius + 1;
@@ -183,7 +178,9 @@ void ChunkStreamer::unloadFar()
             --m_meshed;
             m_events.push_back({coord, {}, true});
         }
-        if (d2 > unload * unload && e.state == State::Ready && !e.meshing && e.pins == 0) {
+        // Mesh jobs read only their own chunk (neighbour data travels as
+        // OuterLayers), so only a chunk being generated or meshed must stay.
+        if (d2 > unload * unload && e.state == State::Ready && !e.meshing) {
             m_chunkPool.release(e.chunk);
             it = m_entries.erase(it);
         } else {
@@ -253,29 +250,33 @@ void ChunkStreamer::submitGenerate(ChunkCoord coord)
     m_pool.submit([this, coord, chunk] {
         ENGINE_PROFILE_SCOPE("generate chunk");
         fillTerrain(*chunk, coord.x, coord.z); // writes every voxel
-        finish({coord, false, {}});
+        // While the chunk is still in this core's cache: record its outer
+        // layers, which is all its neighbours' meshing needs from it.
+        finish({.coord = coord, .isMesh = false, .quads = {}, .outer = computeOuterLayers(*chunk)});
     });
 }
 
 void ChunkStreamer::submitMesh(ChunkCoord coord, Entry& entry)
 {
-    entry.meshing = true;
-    ++entry.pins;
-    ChunkNeighbours nb;
+    entry.meshing = true; // keeps this chunk loaded while the job reads it
+
+    // Boundary masks from the neighbours' outer layers, built here so the job
+    // never touches neighbour chunk memory (cold in cache, and possibly
+    // unloaded while the job runs).
+    std::array<const OuterLayers*, kFaceCount> nb{};
     for (const auto& [face, d] : kSideNeighbours) {
-        Entry* n = find({coord.x + d.first, coord.z + d.second});
-        ++n->pins; // must not be unloaded while the job reads it
-        nb.chunks[static_cast<usize>(face)] = n->chunk;
+        nb[static_cast<usize>(face)] = &find({coord.x + d.first, coord.z + d.second})->outer;
     }
+    BoundaryMasks masks = boundaryFromNeighbours(nb);
+    masks.setSolid(Face::NegY); // nothing is ever seen below the world
+
     ++m_inFlight;
     {
         std::lock_guard lock(m_completionMutex);
         ++m_running;
     }
-    m_pool.submit([this, coord, chunk = entry.chunk, nb, greedy = m_options.greedy] {
+    m_pool.submit([this, coord, chunk = entry.chunk, masks, greedy = m_options.greedy] {
         ENGINE_PROFILE_SCOPE("mesh chunk");
-        BoundaryMasks masks = buildBoundaryMasks(nb);
-        masks.setSolid(Face::NegY); // nothing is ever seen below the world
         // Mesh into a per-thread scratch buffer (capacity reused), then copy
         // out with one exact-size allocation.
         thread_local std::vector<PackedQuad> scratch;
@@ -284,7 +285,7 @@ void ChunkStreamer::submitMesh(ChunkCoord coord, Entry& entry)
         } else {
             meshChunkBinary(*chunk, masks, scratch);
         }
-        finish({coord, true, std::vector<PackedQuad>(scratch.begin(), scratch.end())});
+        finish({.coord = coord, .isMesh = true, .quads = std::vector<PackedQuad>(scratch.begin(), scratch.end())});
     });
 }
 
