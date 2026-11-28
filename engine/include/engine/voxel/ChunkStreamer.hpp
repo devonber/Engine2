@@ -78,6 +78,12 @@ struct StreamingOptions {
     bool greedy = true;  // greedy meshing (else one quad per block face)
     bool ambientOcclusion = true;
     u32 maxJobsInFlight = 0; // 0 = 32 per pool thread (enough to last a frame)
+    // Keep each chunk's voxels after meshing it. Off for terrain that is only
+    // ever looked at (distant levels of detail): a chunk's storage (64 KiB) is
+    // released as soon as its mesh is done, since neighbours only need its
+    // outer layers, which are kept. Such a column is regenerated if it ever
+    // needs meshing again.
+    bool keepChunkData = true;
 };
 
 // A change for the renderer. `removed` = drop the chunk's mesh. Only chunks
@@ -159,6 +165,7 @@ private:
         ColumnCoord coord;
         State state = State::Generating;
         bool allMeshed = false;
+        bool dataDropped = false; // some chunk's voxels were released after meshing (keepChunkData off)
         std::array<ChunkState, kLayers> chunks;
         std::unique_ptr<GenerateOutput> generated; // written by the generate job, read on completion
     };
@@ -180,6 +187,8 @@ private:
     void complete(Completion&& completion);
     void finish(Completion&& completion);
     [[nodiscard]] Column* find(ColumnCoord coord);
+    // A chunk needs meshing but its voxels were released (keepChunkData off).
+    [[nodiscard]] static bool isStale(const Column& col) noexcept;
     [[nodiscard]] i64 distanceSq(ColumnCoord coord) const noexcept;
     void trackSubmit();
 

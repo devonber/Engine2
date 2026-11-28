@@ -30,9 +30,9 @@ layout(push_constant) uniform PushConstants {
 layout(location = 0) out vec2 outUV;
 layout(location = 1) out float outDistance;
 layout(location = 2) flat out uint outLayer;
-layout(location = 3) flat out float outShade;
+layout(location = 3) flat out uint outFace;
 layout(location = 4) out float outOcclusion;
-layout(location = 5) out vec2 outHorizontal;       // camera-relative x, z
+layout(location = 5) out vec3 outPos;              // camera-relative position
 layout(location = 6) flat out float outSeamRadius; // discard closer than this, horizontally (seam pipeline)
 
 // Per face (PosX, NegX, PosY, NegY, PosZ, NegZ): base corner, U axis, V axis.
@@ -42,9 +42,6 @@ layout(location = 6) flat out float outSeamRadius; // discard closer than this, 
 const vec3 kBase[6] = vec3[6](vec3(1, 0, 0), vec3(0, 0, 0), vec3(0, 1, 0), vec3(0, 0, 0), vec3(0, 0, 1), vec3(0, 0, 0));
 const vec3 kU[6]    = vec3[6](vec3(0, 1, 0), vec3(0, 0, 1), vec3(0, 0, 1), vec3(1, 0, 0), vec3(1, 0, 0), vec3(0, 1, 0));
 const vec3 kV[6]    = vec3[6](vec3(0, 0, 1), vec3(0, 1, 0), vec3(1, 0, 0), vec3(0, 0, 1), vec3(0, 1, 0), vec3(1, 0, 0));
-
-// Cheap directional lighting baked per face.
-const float kShade[6] = float[6](0.80, 0.80, 1.00, 0.50, 0.65, 0.65);
 
 // Brightness per ambient-occlusion level (0 = enclosed corner .. 3 = open).
 const float kOcclusion[4] = float[4](0.42, 0.62, 0.81, 1.0);
@@ -100,7 +97,17 @@ void main()
     const ivec3 voxel = chunk.originFirst.xyz + (ivec3(local) << level) - pc.cameraBlock.xyz;
     const vec2 corner2 = vec2(float(corner & 1u), float(corner >> 1));
     const vec3 inBlock = kBase[face] + kU[face] * (corner2.x * size.x) + kV[face] * (corner2.y * size.y);
-    const vec3 pos = vec3(voxel) - pc.cameraFraction.xyz + inBlock * float(1u << level); // relative to the camera
+    vec3 pos = vec3(voxel) - pc.cameraFraction.xyz + inBlock * float(1u << level); // relative to the camera
+
+    // Greedy meshing leaves T-junctions: a long quad edge runs along the
+    // edges of several shorter quads, which meet it at vertices it does not
+    // have. Mathematically the edges coincide, but they are rasterised from
+    // different vertices, so pixels whose centre lies on the line can fall
+    // through both: pinholes showing the sky. Grow every quad a hair within
+    // its own plane (a small fraction of a pixel at any distance) so
+    // neighbours overlap instead of merely touching.
+    const float grow = max(1.0 / 1024.0, length(pos) * 1e-4);
+    pos += (kU[face] * (corner2.x * 2.0 - 1.0) + kV[face] * (corner2.y * 2.0 - 1.0)) * grow;
     gl_Position = pc.viewProj * vec4(pos, 1.0);
     if (level > 0u) {
         // Where a coarse level overlaps the finer one (just beyond a seam),
@@ -108,12 +115,12 @@ void main()
         // slightly further away (reversed Z: depth = z / w, smaller is further).
         gl_Position.z *= 1.0 - 2e-5 * float(level);
     }
-    outHorizontal = pos.xz;
+    outPos = pos;
     outSeamRadius = level == 0u ? 0.0 : pc.cameraFraction.w * float(1u << (level - 1u));
 
     outUV = faceUV(face, inBlock);
     outLayer = faceLayers[block * 6u + face];
-    outShade = kShade[face];
+    outFace = face;
     outOcclusion = kOcclusion[(aoBits >> (2u * corner)) & 3u];
     outDistance = length(pos);
 }

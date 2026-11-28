@@ -2,6 +2,7 @@
 
 #include "engine/core/Types.hpp"
 #include "engine/render/BlockTextures.hpp"
+#include "engine/render/Sky.hpp"
 #include "engine/render/Swapchain.hpp"
 #include "engine/render/VulkanContext.hpp"
 #include "engine/voxel/Mesher.hpp"
@@ -38,6 +39,13 @@ struct RendererDesc {
     // it has meshes, a little beyond the seam, so there are no gaps.
     // 0 = no seams (every chunk drawn wherever it is).
     f32 lodSeam = 0.0f;
+
+    // Sun/moon shadows: cascaded shadow maps (4 layers of shadowMapSize^2)
+    // covering terrain up to shadowDistance blocks from the camera (and no
+    // further than lodSeam: only full-detail chunks cast shadows).
+    bool shadows = true;
+    u32 shadowMapSize = 2048;
+    f32 shadowDistance = 256.0f;
 };
 
 struct FrameStats {
@@ -48,6 +56,7 @@ struct FrameStats {
     f64 cullMs = 0.0;       // CPU time culling chunks and writing the draws (CPU culling only)
     f64 waitMs = 0.0;       // CPU time blocked waiting for the GPU (frame slot fence, swapchain image)
     u32 seamDraws = 0;      // of `draws`: coarse-level draws crossing a seam (need the discard pipeline)
+    u32 shadowDraws = 0;    // draws into the shadow cascades (not included in `draws`)
     bool gpuCulled = false; // counts above come from the GPU, a couple of frames late
     u64 uploadedBytes = 0;  // mesh data copied to the GPU this frame
 };
@@ -82,6 +91,11 @@ public:
     [[nodiscard]] MeshMemoryStats meshStats() const;
     [[nodiscard]] bool gpuCulling() const noexcept { return m_gpuCulling; }
 
+    // Lighting: the direction towards the sun (see Sky.hpp: sunDirectionAt).
+    // Sets the sky, fog, ambient and direct light (the moon at night).
+    void setSun(glm::vec3 towardSun) noexcept { m_sky = skyLightFor(towardSun); }
+    [[nodiscard]] const SkyLight& skyLight() const noexcept { return m_sky; }
+
     // Upload block textures and the (block, face) -> texture layer table.
     // Must be called before anything is drawn. Stalls the GPU; load-time only.
     void setBlockTextures(const BlockTextureSet& textures);
@@ -109,23 +123,49 @@ private:
         bool countersWritten = false;
     };
 
+    static constexpr u32 kCascades = 4;
+
+    // This frame's shadow cascades, all camera-relative like everything else.
+    struct Cascades {
+        bool enabled = false;
+        std::array<glm::mat4, kCascades> viewProj{};              // light clip space (depth 0..1, standard)
+        std::array<std::array<glm::vec4, 5>, kCascades> planes{}; // left, right, bottom, top, far
+        glm::vec4 splits{0.0f};                                   // view depth where each cascade ends
+        glm::vec4 texelSize{0.0f};                                // world size of a shadow texel, per cascade
+        u32 faceMask = 0; // face directions that face the light (bit per voxel::Face): the casters drawn
+        f32 distance = 0.0f;
+    };
+    [[nodiscard]] Cascades computeCascades(const Camera& camera) const;
+
     void createPipeline();
+    void createShadows();
+    void destroyShadows();
+    void recordShadows(VkCommandBuffer cmd, const Frame& frame, const Cascades& cascades, const Camera& camera,
+                       const std::array<u32, kCascades>& counts) const;
     void createCulling();
     void destroyCulling();
-    void recordCulling(VkCommandBuffer cmd, Frame& frame, const Camera& camera) const;
     void createDepth();
     void destroyDepth();
     void createIndexBuffer();
     void destroyTextures();
     void recreateSwapchain();
-    // Draw counts: interior draws at [0, m_maxDraws), seam draws at [m_maxDraws, 2 * m_maxDraws).
+    // Draw lists in the indirect buffers: interior draws at [0, m_maxDraws),
+    // seam draws at [m_maxDraws, 2 * m_maxDraws), then the draws of shadow
+    // cascade c at shadowListOffset(c), m_shadowCap each. With GPU culling
+    // these counts are maximums; the real ones are in the counters buffer.
     struct DrawCounts {
         u32 interior = 0;
         u32 seam = 0;
+        std::array<u32, kCascades> shadow{};
     };
-    [[nodiscard]] DrawCounts cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& stats) const;
-    [[nodiscard]] VkDeviceSize recordFrame(Frame& frame, u32 imageIndex, DrawCounts draws, const Camera& camera,
-                                           bool screenshot);
+    [[nodiscard]] u32 shadowListOffset(u32 cascade) const noexcept { return 2 * m_maxDraws + cascade * m_shadowCap; }
+    [[nodiscard]] u32 totalDraws() const noexcept { return shadowListOffset(kCascades); }
+    void recordCulling(VkCommandBuffer cmd, Frame& frame, const Camera& camera, const Cascades& cascades) const;
+    [[nodiscard]] DrawCounts cullAndWriteDraws(Frame& frame, const Camera& camera, const Cascades& cascades,
+                                               FrameStats& stats) const;
+    [[nodiscard]] VkDeviceSize recordFrame(Frame& frame, u32 imageIndex, const DrawCounts& draws, const Camera& camera,
+                                           const Cascades& cascades, bool screenshot);
+    void writeLighting(u32 frameSlot, const Camera& camera, const Cascades& cascades) const;
     void writeScreenshot();
     [[nodiscard]] f64 readGpuTime(u32 frameIndex) const;
 
@@ -143,8 +183,20 @@ private:
     VkDescriptorSet m_set = VK_NULL_HANDLE;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
-    VkPipeline m_seamPipeline = VK_NULL_HANDLE; // same, discarding fragments inside a chunk's LOD seam
+    VkPipeline m_seamPipeline = VK_NULL_HANDLE;   // same, discarding fragments inside a chunk's LOD seam
+    VkPipeline m_shadowPipeline = VK_NULL_HANDLE; // depth only, into one shadow cascade
     VkFormat m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
+
+    // Lighting: shadow cascades (one depth array image) and per-frame uniforms.
+    SkyLight m_sky;
+    VkImage m_shadowImage = VK_NULL_HANDLE;
+    VmaAllocation m_shadowAllocation = nullptr;
+    VkImageView m_shadowArrayView = VK_NULL_HANDLE;          // sampled
+    std::array<VkImageView, kCascades> m_shadowLayerViews{}; // rendered into
+    VkSampler m_shadowSampler = VK_NULL_HANDLE;              // depth comparison, bilinear (PCF)
+    Buffer m_lightingBuffer;                                 // kFramesInFlight x m_lightingStride
+    VkDeviceSize m_lightingStride = 0;
+    u32 m_shadowCap = 0; // draws per shadow cascade list
 
     Buffer m_indexBuffer; // shared quad index pattern, sized for the densest possible chunk
     std::unique_ptr<ChunkMeshStore> m_meshes;
