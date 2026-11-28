@@ -4,9 +4,11 @@
 // Controls: left-click to capture the mouse, Esc to release it.
 //           WASD move, Space/Shift up/down, Ctrl to go fast.
 //
-// Options:  --radius N        view radius in chunks, per level of detail (default 12)
-//           --lod-levels N    levels of detail (default 4): level L has voxels of 2^L blocks and
-//                             reaches 2^L times as far; 1 = full detail only
+// Options:  --radius N        view distance in chunks of 32 blocks (default 96, up to 1024)
+//           --detail-radius N radius of each level of detail, in its own chunks (default 12, 4..96):
+//                             full detail this far, then 2x coarser voxels for each doubling
+//           --lod-levels N    force N levels of detail (default: as many as --radius needs);
+//                             1 = full detail all the way (radius up to 128)
 //           --vsync           cap to display refresh (default: uncapped)
 //           --validation      force the Vulkan validation layer on (always on in Debug)
 //           --no-validation   force it off
@@ -47,8 +49,9 @@ using namespace engine;
 namespace {
 
 struct Options {
-    i32 radius = 12;
-    u32 lodLevels = 4;
+    i32 radius = 96;
+    i32 detailRadius = 12;
+    u32 lodLevels = 0; // 0 = automatic
     bool vsync = false;
     bool validation = ENGINE_ENABLE_ASSERTS != 0; // on in Debug builds
     i64 frames = -1;
@@ -71,9 +74,11 @@ Options parseArgs(int argc, char** argv)
         const auto arg = [&](const char* name) { return std::strcmp(argv[i], name) == 0; };
         const auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
         if (arg("--radius")) {
-            o.radius = std::clamp(std::atoi(next()), 1, 96);
+            o.radius = std::clamp(std::atoi(next()), 1, 1024);
+        } else if (arg("--detail-radius")) {
+            o.detailRadius = std::clamp(std::atoi(next()), 4, 96);
         } else if (arg("--lod-levels")) {
-            o.lodLevels = static_cast<u32>(std::clamp(std::atoi(next()), 1, 6));
+            o.lodLevels = static_cast<u32>(std::clamp(std::atoi(next()), 1, static_cast<int>(voxel::kMaxLodLevels)));
         } else if (arg("--vsync")) {
             o.vsync = true;
         } else if (arg("--validation")) {
@@ -107,6 +112,58 @@ Options parseArgs(int argc, char** argv)
         }
     }
     return o;
+}
+
+// How far each level of detail streams. Level L has voxels of 2^L blocks and
+// streams `radius` of its own (2^L times larger) chunks. Level L takes over
+// from level L - 1 at a seam radius a little inside where level L - 1 is
+// guaranteed to have meshes; the last level streams as far as needed.
+struct StreamingPlan {
+    std::vector<i32> radii; // per level, in that level's chunks
+    i32 reachChunks = 0;    // view distance, in level-0 chunks
+    f32 lodSeam = 0.0f;     // blocks (RendererDesc::lodSeam)
+    u32 maxChunks = 65536;  // renderer chunk slots
+};
+
+StreamingPlan planStreaming(const Options& opt)
+{
+    StreamingPlan plan;
+    const i32 detail = std::min(opt.detailRadius, opt.radius);
+    u32 levels = opt.lodLevels;
+    if (levels == 0) { // as many as needed: detail * 2^(levels - 1) >= radius
+        levels = 1;
+        while (levels < voxel::kMaxLodLevels && (detail << (levels - 1)) < opt.radius) {
+            ++levels;
+        }
+    }
+    if (levels == 1 || detail < 4) {
+        // Full detail all the way. Memory grows with the square of this.
+        plan.radii = {std::min(opt.radius, 128)};
+        if (opt.radius > 128) {
+            std::fprintf(stderr, "Full-detail radius limited to 128 chunks (use levels of detail to see further)\n");
+        }
+    } else {
+        plan.radii.assign(levels - 1, detail);
+        // The last level: as far as asked, but at least past its own seam.
+        const i32 scale = 1 << (levels - 1);
+        const i32 minOuter = (detail - 3 + 1) / 2 + 2;
+        i32 outer = std::max((opt.radius + scale - 1) / scale, minOuter);
+        if (outer > 128) {
+            outer = 128;
+            std::fprintf(stderr, "Outermost level limited to 128 chunks: add levels of detail to see further\n");
+        }
+        plan.radii.push_back(outer);
+        plan.lodSeam = static_cast<f32>(detail - 3) * 32.0f;
+    }
+    plan.reachChunks = plan.radii.back() << (plan.radii.size() - 1);
+
+    // Chunk slots: about two meshes per column on this terrain; plenty of slack.
+    f64 estimate = 0.0;
+    for (const i32 r : plan.radii) {
+        estimate += 3.15 * (r + 2) * (r + 2) * 2.5;
+    }
+    plan.maxChunks = static_cast<u32>(std::clamp(estimate, 65536.0, 262144.0));
+    return plan;
 }
 
 void updateCamera(render::Camera& cam, const platform::InputState& in, f32 dt)
@@ -148,20 +205,17 @@ int main(int argc, char** argv)
 
     platform::Window window("Engine2", 1600, 900);
     render::VulkanContext ctx(window, {.appName = "Engine2 Sandbox", .validation = opt.validation});
-    // Each level of detail streams the same radius in its own (2^L times
-    // larger) chunks. Level L takes over from level L - 1 at the seam,
-    // a little inside where level L - 1 is guaranteed to have meshes.
-    const u32 lodLevels = opt.radius >= 4 ? opt.lodLevels : 1;
-    const f32 levelRadius = static_cast<f32>(opt.radius) * 32.0f; // blocks, at level 0
-    const f32 farthest = levelRadius * static_cast<f32>(1u << (lodLevels - 1));
+    const StreamingPlan plan = planStreaming(opt);
+    const f32 farthest = static_cast<f32>(plan.reachChunks) * 32.0f; // blocks
     render::Renderer renderer(ctx, window,
                               {
                                   .presentMode = opt.vsync ? render::PresentMode::Vsync : render::PresentMode::Uncapped,
                                   .fogDistance = farthest * 0.95f,
+                                  .maxChunks = plan.maxChunks,
                                   .quadCapacity = static_cast<u64>(opt.meshMemoryMiB) * 1024 * 1024 / 8,
                                   .faceCulling = opt.faceCulling,
                                   .gpuCulling = opt.gpuCulling,
-                                  .lodSeam = lodLevels > 1 ? static_cast<f32>(opt.radius - 3) * 32.0f : 0.0f,
+                                  .lodSeam = plan.lodSeam,
                               });
 
     using Clock = std::chrono::steady_clock;
@@ -180,16 +234,18 @@ int main(int argc, char** argv)
     // One streamer per level of detail. Updated finest first, so each frame
     // the nearby (most visible) work is queued ahead of the distant work.
     std::vector<std::unique_ptr<voxel::ChunkStreamer>> streamers;
-    for (u32 level = 0; level < lodLevels; ++level) {
+    for (u32 level = 0; level < plan.radii.size(); ++level) {
         streamers.push_back(std::make_unique<voxel::ChunkStreamer>(
             pool, voxel::StreamingOptions{
-                      .viewRadius = opt.radius,
+                      .viewRadius = plan.radii[level],
                       .level = level,
                       .greedy = opt.greedy,
                       .ambientOcclusion = opt.ao,
                       // Fewer queued jobs for the coarse levels, so they cannot
                       // crowd out nearby work when the camera moves.
                       .maxJobsInFlight = level == 0 ? 0u : 8u * pool.concurrency(),
+                      // Coarse terrain is never edited: keep only meshes.
+                      .keepChunkData = level == 0,
                   }));
     }
     const auto streamStats = [&] {
@@ -205,10 +261,14 @@ int main(int argc, char** argv)
         return total;
     };
     std::fprintf(stderr, "Culling: %s\n", renderer.gpuCulling() ? "GPU (compute + draw indirect count)" : "CPU");
+    std::string radii;
+    for (const i32 r : plan.radii) {
+        radii += (radii.empty() ? "" : ", ") + std::to_string(r);
+    }
     std::fprintf(stderr,
-                 "Streaming: view radius %d chunks x %u levels of detail (%.0f blocks), %u worker threads, %s "
-                 "meshing\n",
-                 opt.radius, lodLevels, static_cast<f64>(farthest), pool.workerCount(),
+                 "Streaming: view distance %d chunks (%.0f blocks), %zu levels of detail (radii %s), %u worker "
+                 "threads, %s meshing\n",
+                 plan.reachChunks, static_cast<f64>(farthest), plan.radii.size(), radii.c_str(), pool.workerCount(),
                  opt.greedy ? "greedy" : "binary");
 
     render::Camera camera;
