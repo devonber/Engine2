@@ -45,19 +45,35 @@ inline constexpr u32 kMaxVerticalLodLevel = 2;
 struct TerrainColumn {
     std::array<i16, kChunkArea> height;    // top solid cell + 1, [x + z * 32]
     std::array<i16, kChunkArea> sandDepth; // surface cells that are sand (lowland), else 0
+    std::array<i16, kChunkArea> soilDepth; // cells of dirt (top one grass) above stone; 0 for bare rock
     i32 minHeight = 0;
     i32 maxHeight = 0;
-    i32 dirtDepth = 4; // cells of dirt (incl. the surface cell) above stone
+    i32 dirtDepth = 4; // the most soilDepth can be
     u32 level = 0;
 };
 
-// Large rolling mountains and valleys with small hills on top; sand in low
-// ground, grass over dirt over stone elsewhere. At level L > 0 each cell
-// takes the surface height averaged over its footprint (each term of the
-// heightmap is box-filtered exactly, so hills smaller than a cell fade out
-// instead of aliasing into regular stripes), and a cell is solid when that
-// surface covers at least half of it.
+// Noise-based terrain (see Noise.hpp): domain-warped continents of
+// lowlands and highlands, rolling hills, and ridged mountains where a
+// low-frequency mask allows (more often on high ground). Sand in low ground,
+// bare rock on high peaks, grass over dirt over stone elsewhere.
+//
+// At level L > 0 each cell is sampled at its centre with the noise octaves
+// smaller than a cell faded out (their box-filtered response), so a cell
+// follows the average surface over its footprint instead of aliasing small
+// hills into regular patterns, and is solid when that surface covers at
+// least half of it.
 void terrainColumn(i32 chunkX, i32 chunkZ, TerrainColumn& out, u32 level = 0);
+
+// The terrain at block bx + dx, bz + dz as level `level` sees it, computed
+// on its own (terrainColumn computes many at once, with AVX2 where
+// available): the surface height in blocks before rounding, and the hill
+// and mountain parts of it. For tests and tools.
+struct TerrainSample {
+    f32 height;
+    f32 hills;    // the hills' part of the height (blocks)
+    f32 mountain; // the mountains' part (blocks)
+};
+[[nodiscard]] TerrainSample terrainSample(i32 bx, f32 dx, i32 bz, f32 dz, u32 level = 0) noexcept;
 
 // Many chunks are a single block type; they need no storage and little or
 // no meshing. Decided from the heightmap alone, before filling anything.

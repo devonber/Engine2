@@ -22,7 +22,7 @@
 //           --no-face-culling draw back-facing face directions too (for comparison)
 //           --cpu-culling     cull chunks on the CPU instead of the GPU (for comparison)
 //           --mesh-memory MiB initial GPU mesh buffer size (grows as needed; default 64)
-//           --camera x,y,z,yaw,pitch   start position (yaw/pitch in degrees)
+//           --camera x,y,z,yaw,pitch   start position (yaw/pitch in degrees; default: 25 blocks above the ground)
 //           --assets DIR      asset folder (default: <repo>/assets)
 //           --mesher M        greedy (default) or binary (one quad per block face)
 //           --threads N       threads in total for background work (default: all hardware threads)
@@ -72,7 +72,8 @@ struct Options {
     u32 meshMemoryMiB = 64;
     u32 threads = 0; // 0 = all hardware threads
     f32 fly = 0.0f;
-    f32 camera[5] = {0.0f, 90.0f, 40.0f, 0.0f, -20.0f};
+    f32 camera[5] = {0.0f, 0.0f, 40.0f, 0.0f, -20.0f};
+    bool cameraGiven = false; // else start above the ground
 };
 
 Options parseArgs(int argc, char** argv)
@@ -121,6 +122,7 @@ Options parseArgs(int argc, char** argv)
             o.assets = next();
         } else if (arg("--camera")) {
             std::sscanf(next(), "%f,%f,%f,%f,%f", &o.camera[0], &o.camera[1], &o.camera[2], &o.camera[3], &o.camera[4]);
+            o.cameraGiven = true;
         } else {
             std::fprintf(stderr, "Unknown option: %s\n", argv[i]);
         }
@@ -290,6 +292,12 @@ int main(int argc, char** argv)
 
     render::Camera camera;
     camera.position = {opt.camera[0], opt.camera[1], opt.camera[2]};
+    if (!opt.cameraGiven) {
+        // 25 blocks above the ground, which could be anywhere from sea level to a peak.
+        const i32 bx = static_cast<i32>(std::floor(opt.camera[0]));
+        const i32 bz = static_cast<i32>(std::floor(opt.camera[2]));
+        camera.position.y = static_cast<f64>(voxel::terrainSample(bx, 0.0f, bz, 0.0f).height) + 25.0;
+    }
     camera.yaw = glm::radians(opt.camera[3]);
     camera.pitch = glm::radians(opt.camera[4]);
 

@@ -3,6 +3,7 @@ add_executable(engine_tests
     test_bits.cpp
     test_chunk.cpp
     test_mesher.cpp
+    test_noise.cpp
     test_streamer.cpp
     test_thread_pool.cpp
     test_world.cpp)

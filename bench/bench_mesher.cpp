@@ -18,8 +18,14 @@ void runMesherBenchmarks()
     std::vector<PackedQuad> quads;
     quads.reserve(kChunkVolume * 3); // never reallocate inside the timed loop
 
-    // A surface chunk with all 26 terrain neighbours, as in the streamed world.
-    constexpr i32 cx = 0, cy = 1, cz = 0;
+    // A surface chunk with all 26 terrain neighbours, as in the streamed world:
+    // the layer that contains the column's middle surface height.
+    constexpr i32 cx = 0, cz = 0;
+    const i32 cy = [] {
+        TerrainColumn column;
+        terrainColumn(cx, cz, column);
+        return (column.minHeight + column.maxHeight) / 2 / static_cast<i32>(kChunkSize);
+    }();
     std::vector<std::unique_ptr<Chunk>> owned;
     std::vector<OuterLayers> outer(kNeighbourhoodSize);
     ChunkNeighbourhood terrainNeighbours;

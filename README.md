@@ -87,13 +87,23 @@ Vulkan 1.3, written for throughput:
 - **Long view distances**: everything is drawn relative to the camera (integer block + fraction, camera
   position in double precision), so precision is the same a million blocks from the origin. Each chunk's
   quads are grouped by face direction and only the directions that can face the camera are drawn (about
-  27% fewer quads on terrain). The mesh buffer grows on demand. `--radius` goes up to 96.
+  27% fewer quads on terrain). The mesh buffer grows on demand.
 - **GPU-driven culling**: a compute shader tests every chunk (distance, frustum, face directions) and writes
   the draw commands; one `vkCmdDrawIndexedIndirectCount` draws them, so the CPU never walks the chunk list.
   Falls back to CPU culling (`--cpu-culling`) on GPUs without draw-indirect-count. Both paths produce
   pixel-identical images.
+- **Noise-based terrain** (`engine/voxel/Noise.hpp`, `Generate.cpp`): 2D gradient noise in integer +
+  offset coordinates (lattices are powers of two), so it is exactly as precise a million blocks out as at
+  the origin. Domain-warped continents, rolling hills with relief at every scale (256 to 16 blocks), and
+  ridged mountains where a low-frequency mask allows; sand in the lowlands, bare rock on steep slopes
+  and high peaks, grass over dirt elsewhere. 8 positions at a time with AVX2 (a scalar reference is
+  tested against it): about 40 us per 32x32 column heightmap. The shape constants are at the top of
+  `Generate.cpp`. Coarse levels of detail fade out noise octaves smaller than a cell (box-filter
+  response; ridges fade to their mean), so distant terrain follows the average surface instead of
+  aliasing into patterns.
 - **Levels of detail** for distant terrain: level L is the same world with voxels of 2^L blocks, so a
-  level-L chunk covers 2^L times the distance with the same 32^3 cells, mesher, ambient occlusion and
+  level-L chunk covers 2^L times the distance with the same 32^3 cells (cells stop growing vertically at
+  4 blocks, the world being only 128 tall), mesher, ambient occlusion and
   culling. Each level streams `--detail-radius` (default 12) of its own chunks around the camera, and as
   many levels are used as `--radius` (the view distance, up to 1024 chunks = 32,768 blocks) needs.
   Level L takes over from level L-1 at a horizontal seam radius, tested per pixel (horizontal distance
