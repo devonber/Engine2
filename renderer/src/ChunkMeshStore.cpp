@@ -203,6 +203,9 @@ void ChunkMeshStore::remove(u64 key)
 void ChunkMeshStore::releaseSlot(u32 index)
 {
     Slot& slot = m_slots[index];
+    if (slot.drawable && slot.level == 0) {
+        ++m_fullDetailVersion;
+    }
     --m_chunks;
     m_quadCount -= slot.quadCount;
     slot.used = false;
@@ -276,6 +279,9 @@ VkDeviceSize ChunkMeshStore::recordUploads(VkCommandBuffer cmd, u32 frameSlot)
         offset += bytes;
 
         slot.drawable = true; // copied before this frame's culling and draws (barrier below)
+        if (slot.level == 0) {
+            ++m_fullDetailVersion;
+        }
         markDirty(p.slot);
         m_pendingBytes -= bytes;
         m_pending.pop_front();

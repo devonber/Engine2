@@ -297,6 +297,7 @@ int main(int argc, char** argv)
     auto statsStart = Clock::now();
     f64 cpuAccumMs = 0.0, gpuAccumMs = 0.0, streamAccumMs = 0.0, cullAccumMs = 0.0, waitAccumMs = 0.0;
     u64 uploadAccum = 0;
+    u64 shadowMapsAccum = 0;
     u32 statFrames = 0;
 
     // Automated runs (--frames) count frames from when the initial area has
@@ -371,6 +372,7 @@ int main(int argc, char** argv)
         const render::FrameStats stats = renderer.renderFrame(camera);
         cpuAccumMs += std::chrono::duration<f64, std::milli>(Clock::now() - cpuStart).count() - stats.waitMs;
         waitAccumMs += stats.waitMs;
+        shadowMapsAccum += stats.shadowMaps;
         gpuAccumMs += stats.gpuMs;
         cullAccumMs += stats.cullMs;
         uploadAccum += stats.uploadedBytes;
@@ -387,11 +389,13 @@ int main(int argc, char** argv)
             // render cpu excludes waiting for the GPU (shown separately as wait).
             const std::string title = std::format(
                 "Engine2 | {:.0f} fps | render cpu {:.2f} ms (cpu cull {:.2f}), wait {:.2f} ms | gpu {:.2f} ms | "
-                "stream {:.2f} ms | {} chunks, {} draws ({} seam, {} shadow), {:.2f}M quads | {} meshed, {} jobs, "
+                "stream {:.2f} ms | {} chunks, {} draws ({} seam, {} shadow, {:.1f} shadow maps/frame), {:.2f}M quads "
+                "| {} meshed, {} jobs, "
                 "{:.1f} MB/s up, mesh mem {:.0f}/{:.0f} MiB | {:02d}:{:02d}",
                 statFrames / elapsed, cpuAccumMs / statFrames, cullAccumMs / statFrames, waitAccumMs / statFrames,
                 gpuAccumMs / statFrames, streamAccumMs / statFrames, stats.drawnChunks, stats.draws, stats.seamDraws,
-                stats.shadowDraws, static_cast<f64>(stats.drawnQuads) / 1e6, ss.meshedChunks, ss.jobsInFlight,
+                stats.shadowDraws, static_cast<f64>(shadowMapsAccum) / statFrames,
+                static_cast<f64>(stats.drawnQuads) / 1e6, ss.meshedChunks, ss.jobsInFlight,
                 static_cast<f64>(uploadAccum) / elapsed / 1e6, static_cast<f64>(ms.usedBytes) / (1024.0 * 1024.0),
                 static_cast<f64>(ms.capacityBytes) / (1024.0 * 1024.0), static_cast<int>(timeOfDay),
                 static_cast<int>(std::fmod(timeOfDay, 1.0f) * 60.0f));
@@ -410,6 +414,7 @@ int main(int argc, char** argv)
             }
             statsStart = Clock::now();
             cpuAccumMs = gpuAccumMs = streamAccumMs = cullAccumMs = waitAccumMs = 0.0;
+            shadowMapsAccum = 0;
             uploadAccum = 0;
             statFrames = 0;
         }
