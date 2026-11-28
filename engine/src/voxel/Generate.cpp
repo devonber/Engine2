@@ -45,8 +45,13 @@ void terrainColumn(i32 chunkX, i32 chunkZ, TerrainColumn& out, u32 level)
     }
 
     out.level = level;
-    out.dirtDepth = std::max(1, 4 >> level);
-    const i16 sandCells = static_cast<i16>(std::max(1, 3 >> level));
+    // Layer depths in cells, rounded up so coarse levels show what level 0
+    // shows: sand 3 blocks deep covers the terraces of lowland terrain; if it
+    // were rounded down (1 cell at level 1), 2-cell steps would expose dirt
+    // as specks all over distant sand.
+    const auto cellsCovering = [level](i32 blocks) { return (blocks + lodScale(level) - 1) >> level; };
+    out.dirtDepth = cellsCovering(4);
+    const i16 sandCells = static_cast<i16>(cellsCovering(3));
     out.minHeight = kWorldHeight;
     out.maxHeight = 0;
     for (u32 z = 0; z < kChunkSize; ++z) {
@@ -58,8 +63,7 @@ void terrainColumn(i32 chunkX, i32 chunkZ, TerrainColumn& out, u32 level)
             out.minHeight = std::min(out.minHeight, cells);
             out.maxHeight = std::max(out.maxHeight, cells);
             out.height[z * kChunkSize + x] = static_cast<i16>(cells);
-            out.sandDepth[z * kChunkSize + x] =
-                static_cast<i16>(blocks <= kSandLevel ? (level == 0 ? 3 : sandCells) : 0);
+            out.sandDepth[z * kChunkSize + x] = static_cast<i16>(blocks <= kSandLevel ? sandCells : 0);
         }
     }
 }
