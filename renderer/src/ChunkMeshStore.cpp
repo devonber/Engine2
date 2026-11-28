@@ -50,7 +50,7 @@ ChunkMeshStore::~ChunkMeshStore()
     destroyBuffer(allocator, m_origins);
 }
 
-bool ChunkMeshStore::set(u64 key, glm::ivec3 origin, std::vector<voxel::PackedQuad>&& quads)
+bool ChunkMeshStore::set(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads)
 {
     if (const auto it = m_slotOf.find(key); it != m_slotOf.end()) {
         releaseSlot(it->second); // the old mesh may still be drawn by in-flight frames
@@ -92,7 +92,7 @@ bool ChunkMeshStore::set(u64 key, glm::ivec3 origin, std::vector<voxel::PackedQu
     m_quadCount += slot.quadCount;
     if (!quads.empty()) {
         m_pendingBytes += quads.size() * kQuadBytes;
-        m_pending.push_back({index, slot.generation, std::move(quads)});
+        m_pending.push_back({index, slot.generation, std::vector<voxel::PackedQuad>(quads.begin(), quads.end())});
     }
     return true;
 }

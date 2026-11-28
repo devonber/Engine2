@@ -51,7 +51,7 @@ public:
 
     // Add or replace a chunk's mesh. False if there is no room (the chunk
     // is then not drawn). Call between frames.
-    bool set(u64 key, glm::ivec3 origin, std::vector<voxel::PackedQuad>&& quads);
+    bool set(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads);
     void remove(u64 key);
 
     // Frame protocol, called by the renderer:

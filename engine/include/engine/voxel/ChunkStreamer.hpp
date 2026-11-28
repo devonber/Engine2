@@ -7,6 +7,7 @@
 #include <array>
 #include <compare>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -111,6 +112,10 @@ public:
     // Mesh changes since the last call, in completion order.
     [[nodiscard]] std::vector<ChunkMeshEvent> takeMeshEvents();
 
+    // Optional: hand an event's quad vector back once you are done with it.
+    // Mesh jobs reuse these instead of allocating on worker threads.
+    void recycle(std::vector<PackedQuad>&& quads);
+
     struct Stats {
         u32 loadedColumns = 0;
         u32 storedChunks = 0; // chunks with their own memory (not uniform)
@@ -136,19 +141,28 @@ private:
         bool hasMesh = false; // the renderer has a non-empty mesh for it
     };
 
+    // What a generate job produces for its column. Allocated by the main
+    // thread at submit time and owned by the Column, so the completion that
+    // goes through the shared queue stays small.
+    struct GenerateOutput {
+        std::array<ChunkContent, kLayers> contents{};
+        std::array<OuterLayers, kLayers> outer;
+    };
+
     struct Column {
         ColumnCoord coord;
         State state = State::Generating;
         bool allMeshed = false;
         std::array<ChunkState, kLayers> chunks;
+        std::unique_ptr<GenerateOutput> generated; // written by the generate job, read on completion
     };
 
+    // Small on purpose (~40 bytes): finishing jobs append these to one
+    // shared vector under a lock, so anything large here becomes a convoy.
     struct Completion {
         ColumnCoord column;
-        i32 layer = -1; // -1: generation of the whole column, else the meshed chunk layer
-        std::vector<PackedQuad> quads;
-        std::array<ChunkContent, kLayers> contents{};
-        std::array<OuterLayers, kLayers> outer;
+        i32 layer = -1;                // -1: the column's generation finished, else the meshed chunk layer
+        std::vector<PackedQuad> quads; // mesh jobs
     };
 
     void collectCompletions();
@@ -168,9 +182,10 @@ private:
     u32 m_maxInFlight = 0;
     ChunkPool m_chunkPool;
     std::unordered_map<u64, Column> m_columns;
-    std::vector<std::pair<i32, i32>> m_offsets; // (dx, dz) within viewRadius + 1, nearest first
-    usize m_scanStart = 0;                      // m_offsets[0, m_scanStart) are finished columns: skip them
-    std::vector<ThreadPool::Job> m_batch;       // jobs scheduled this update, submitted together
+    std::vector<std::pair<i32, i32>> m_offsets;         // (dx, dz) within viewRadius + 1, nearest first
+    usize m_scanStart = 0;                              // m_offsets[0, m_scanStart) are finished columns: skip them
+    std::vector<ThreadPool::Job> m_batch;               // jobs scheduled this update, submitted together
+    std::vector<std::vector<PackedQuad>> m_spareMeshes; // recycled output vectors for mesh jobs
     ColumnCoord m_center;
     bool m_hasCenter = false;
     bool m_settled = false;
@@ -185,8 +200,9 @@ private:
     // m_running == 0 no job touches this object again.
     std::mutex m_completionMutex;
     std::condition_variable m_jobsDone;
-    std::vector<Completion> m_completions;
-    u32 m_running = 0; // jobs that have not finished executing (guarded by m_completionMutex)
+    std::vector<Completion> m_completions; // capacity kept: never grows under the lock in steady state
+    std::vector<Completion> m_drained;     // main thread's side of the swap
+    u32 m_running = 0;                     // jobs that have not finished executing (guarded by m_completionMutex)
 };
 
 } // namespace engine::voxel

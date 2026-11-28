@@ -59,10 +59,10 @@ public:
     Renderer& operator=(const Renderer&) = delete;
 
     // Add or replace the mesh of the chunk identified by `key`; `origin` is the
-    // world position of its voxel (0,0,0). Uploaded in the background over
+    // world position of its voxel (0,0,0). The quads are copied. Uploaded in the background over
     // the next frames (see RendererDesc::uploadBudgetBytes). False if there is
     // no room. Call between frames.
-    bool setChunkMesh(u64 key, glm::ivec3 origin, std::vector<voxel::PackedQuad>&& quads);
+    bool setChunkMesh(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads);
     void removeChunkMesh(u64 key);
     [[nodiscard]] MeshMemoryStats meshStats() const;
 
