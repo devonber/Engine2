@@ -10,7 +10,10 @@
 namespace engine::render {
 
 struct Camera {
-    glm::vec3 position{0.0f, 40.0f, 0.0f};
+    // World position in double precision: a float has only ~1/8 block of
+    // precision at 1,000,000 blocks out. Rendering never uses it directly;
+    // everything is drawn relative to the camera (see viewRotation()).
+    glm::dvec3 position{0.0, 40.0, 0.0};
     f32 yaw = 0.0f;   // radians; 0 looks down -Z
     f32 pitch = 0.0f; // radians; positive looks up
     f32 fovY = glm::radians(70.0f);
@@ -24,10 +27,19 @@ struct Camera {
 
     [[nodiscard]] glm::vec3 right() const noexcept { return glm::normalize(glm::cross(forward(), {0.0f, 1.0f, 0.0f})); }
 
-    [[nodiscard]] glm::mat4 view() const noexcept
+    // View matrix with the camera at the origin: geometry is positioned
+    // relative to the camera before it gets here (camera-relative rendering),
+    // so precision does not degrade far from the world origin.
+    [[nodiscard]] glm::mat4 viewRotation() const noexcept
     {
-        return glm::lookAtRH(position, position + forward(), glm::vec3{0.0f, 1.0f, 0.0f});
+        return glm::lookAtRH(glm::vec3{0.0f}, forward(), glm::vec3{0.0f, 1.0f, 0.0f});
     }
+
+    // Integer block containing the camera and the offset within it, split so
+    // positions relative to the camera can be formed exactly as
+    // (integer block - cameraBlock) - cameraFraction.
+    [[nodiscard]] glm::ivec3 cameraBlock() const noexcept { return glm::ivec3{glm::floor(position)}; }
+    [[nodiscard]] glm::vec3 cameraFraction() const noexcept { return glm::vec3{position - glm::floor(position)}; }
 
     // Reversed-Z, infinite far plane, Vulkan clip space (Y down, depth 0..1).
     // Depth is 1 at the near plane and approaches 0 at infinity. With a float

@@ -12,6 +12,8 @@
 //           --screenshot F    save the last of those frames (or frame 60) to F (.bmp)
 //           --fly SPEED       fly forward automatically at SPEED blocks/s once loaded
 //           --no-ao           turn ambient occlusion off (for comparison)
+//           --no-face-culling draw back-facing face directions too (for comparison)
+//           --mesh-memory MiB initial GPU mesh buffer size (grows as needed; default 64)
 //           --camera x,y,z,yaw,pitch   start position (yaw/pitch in degrees)
 //           --assets DIR      asset folder (default: <repo>/assets)
 //           --mesher M        greedy (default) or binary (one quad per block face)
@@ -50,6 +52,8 @@ struct Options {
     std::string assets = ENGINE_ASSET_DIR;
     bool greedy = true;
     bool ao = true;
+    bool faceCulling = true;
+    u32 meshMemoryMiB = 64;
     u32 threads = 0; // 0 = all hardware threads
     f32 fly = 0.0f;
     f32 camera[5] = {0.0f, 90.0f, 40.0f, 0.0f, -20.0f};
@@ -62,7 +66,7 @@ Options parseArgs(int argc, char** argv)
         const auto arg = [&](const char* name) { return std::strcmp(argv[i], name) == 0; };
         const auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
         if (arg("--radius")) {
-            o.radius = std::clamp(std::atoi(next()), 1, 64);
+            o.radius = std::clamp(std::atoi(next()), 1, 96);
         } else if (arg("--vsync")) {
             o.vsync = true;
         } else if (arg("--validation")) {
@@ -77,6 +81,10 @@ Options parseArgs(int argc, char** argv)
             o.greedy = std::strcmp(next(), "binary") != 0;
         } else if (arg("--threads")) {
             o.threads = static_cast<u32>(std::clamp(std::atoi(next()), 0, 256));
+        } else if (arg("--no-face-culling")) {
+            o.faceCulling = false;
+        } else if (arg("--mesh-memory")) {
+            o.meshMemoryMiB = static_cast<u32>(std::clamp(std::atoi(next()), 1, 4096));
         } else if (arg("--no-ao")) {
             o.ao = false;
         } else if (arg("--fly")) {
@@ -117,7 +125,7 @@ void updateCamera(render::Camera& cam, const platform::InputState& in, f32 dt)
         move.y -= 1.0f;
     if (glm::dot(move, move) > 0.0f) {
         const f32 speed = in.down(Key::LeftControl) ? 120.0f : 25.0f; // blocks per second
-        cam.position += glm::normalize(move) * speed * dt;
+        cam.position += glm::dvec3{glm::normalize(move) * speed * dt};
     }
 }
 
@@ -135,6 +143,8 @@ int main(int argc, char** argv)
                               {
                                   .presentMode = opt.vsync ? render::PresentMode::Vsync : render::PresentMode::Uncapped,
                                   .fogDistance = static_cast<f32>(opt.radius) * 32.0f * 0.95f,
+                                  .quadCapacity = static_cast<u64>(opt.meshMemoryMiB) * 1024 * 1024 / 8,
+                                  .faceCulling = opt.faceCulling,
                               });
 
     using Clock = std::chrono::steady_clock;
@@ -161,7 +171,7 @@ int main(int argc, char** argv)
 
     // Title-bar stats, averaged over half a second.
     auto statsStart = Clock::now();
-    f64 cpuAccumMs = 0.0, gpuAccumMs = 0.0, streamAccumMs = 0.0;
+    f64 cpuAccumMs = 0.0, gpuAccumMs = 0.0, streamAccumMs = 0.0, cullAccumMs = 0.0;
     u64 uploadAccum = 0;
     u32 statFrames = 0;
 
@@ -172,6 +182,7 @@ int main(int argc, char** argv)
     i64 framesAfterLoad = 0;
     const i64 screenshotFrame = opt.screenshot.empty() ? -1 : (opt.frames > 0 ? opt.frames - 1 : 60);
 
+    u32 lastGrows = 0;
     auto last = Clock::now();
     while (!window.shouldClose()) {
         if (loaded && opt.frames >= 0 && framesAfterLoad >= opt.frames) {
@@ -185,7 +196,7 @@ int main(int argc, char** argv)
         updateCamera(camera, window.input(), dt);
         if (loaded && opt.fly > 0.0f) {
             const glm::vec3 flat = glm::normalize(glm::vec3{std::sin(camera.yaw), 0.0f, -std::cos(camera.yaw)});
-            camera.position += flat * opt.fly * dt;
+            camera.position += glm::dvec3{flat * opt.fly * dt};
         }
 
         // Streaming: schedule work around the camera, hand finished meshes to the GPU.
@@ -222,6 +233,7 @@ int main(int argc, char** argv)
         const render::FrameStats stats = renderer.renderFrame(camera);
         cpuAccumMs += std::chrono::duration<f64, std::milli>(Clock::now() - cpuStart).count();
         gpuAccumMs += stats.gpuMs;
+        cullAccumMs += stats.cullMs;
         uploadAccum += stats.uploadedBytes;
         ++statFrames;
         if (loaded) {
@@ -234,21 +246,28 @@ int main(int argc, char** argv)
             const voxel::ChunkStreamer::Stats ss = streamer.stats();
             const render::MeshMemoryStats ms = renderer.meshStats();
             const std::string title = std::format(
-                "Engine2 | {:.0f} fps | render cpu {:.2f} ms | gpu {:.2f} ms | stream {:.2f} ms | {} chunks | "
-                "{:.2f}M quads | {} meshed, {} jobs, {:.1f} MB/s up, mesh mem {:.0f}/{:.0f} MiB",
-                statFrames / elapsed, cpuAccumMs / statFrames, gpuAccumMs / statFrames, streamAccumMs / statFrames,
-                stats.drawnChunks, static_cast<f64>(stats.drawnQuads) / 1e6, ss.meshedChunks, ss.jobsInFlight,
-                static_cast<f64>(uploadAccum) / elapsed / 1e6, static_cast<f64>(ms.usedBytes) / (1024.0 * 1024.0),
+                "Engine2 | {:.0f} fps | render cpu {:.2f} ms (cull {:.2f}) | gpu {:.2f} ms | stream {:.2f} ms | "
+                "{} chunks, {} draws, {:.2f}M quads | {} meshed, {} jobs, {:.1f} MB/s up, mesh mem {:.0f}/{:.0f} MiB",
+                statFrames / elapsed, cpuAccumMs / statFrames, cullAccumMs / statFrames, gpuAccumMs / statFrames,
+                streamAccumMs / statFrames, stats.drawnChunks, stats.draws, static_cast<f64>(stats.drawnQuads) / 1e6,
+                ss.meshedChunks, ss.jobsInFlight, static_cast<f64>(uploadAccum) / elapsed / 1e6,
+                static_cast<f64>(ms.usedBytes) / (1024.0 * 1024.0),
                 static_cast<f64>(ms.capacityBytes) / (1024.0 * 1024.0));
             window.setTitle(title.c_str());
             if (opt.frames >= 0) {
                 std::fprintf(stderr, "%s\n", title.c_str());
             }
             if (ms.failed > 0) {
-                std::fprintf(stderr, "Warning: %u chunk meshes did not fit (raise RendererDesc limits)\n", ms.failed);
+                std::fprintf(stderr, "Warning: %u chunk meshes did not fit (raise RendererDesc::maxChunks)\n",
+                             ms.failed);
+            }
+            if (ms.grows != lastGrows) {
+                std::fprintf(stderr, "Mesh buffer grew to %.0f MiB\n",
+                             static_cast<f64>(ms.capacityBytes) / (1024.0 * 1024.0));
+                lastGrows = ms.grows;
             }
             statsStart = Clock::now();
-            cpuAccumMs = gpuAccumMs = streamAccumMs = 0.0;
+            cpuAccumMs = gpuAccumMs = streamAccumMs = cullAccumMs = 0.0;
             uploadAccum = 0;
             statFrames = 0;
         }

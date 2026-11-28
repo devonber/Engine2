@@ -4,10 +4,12 @@
 #include "engine/render/VulkanContext.hpp"
 #include "engine/voxel/Mesher.hpp"
 
+#include <array>
 #include <deque>
 #include <glm/glm.hpp>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace engine::render {
@@ -29,6 +31,10 @@ public:
         u32 firstQuad = 0;
         u32 quadCount = 0;
         u32 generation = 0; // bumped on every set(); cancels stale pending uploads
+        // Quads are stored grouped by face direction (voxel::Face order):
+        // direction f is quads [faceStart[f], faceStart[f + 1]) of this mesh,
+        // so draws can skip directions that face away from the camera.
+        std::array<u32, voxel::kFaceCount + 1> faceStart{};
         bool used = false;
         bool drawable = false; // upload recorded
         VmaVirtualAllocation allocation = VK_NULL_HANDLE;
@@ -40,7 +46,8 @@ public:
         u64 usedBytes = 0;
         u64 capacityBytes = 0;
         u64 pendingBytes = 0; // queued, not yet uploaded
-        u32 failed = 0;       // meshes rejected because the quad buffer was full
+        u32 failed = 0;       // meshes rejected: no free chunk slot
+        u32 grows = 0;        // times the quad buffer was enlarged
     };
 
     ChunkMeshStore(VulkanContext& ctx, u64 quadCapacity, u32 maxChunks, u32 framesInFlight,
@@ -49,8 +56,9 @@ public:
     ChunkMeshStore(const ChunkMeshStore&) = delete;
     ChunkMeshStore& operator=(const ChunkMeshStore&) = delete;
 
-    // Add or replace a chunk's mesh. False if there is no room (the chunk
-    // is then not drawn). Call between frames.
+    // Add or replace a chunk's mesh. Grows the quad buffer when it is full
+    // (stalls the GPU once). False only if every chunk slot is in use.
+    // Call between frames.
     bool set(u64 key, glm::ivec3 origin, std::span<const voxel::PackedQuad> quads);
     void remove(u64 key);
 
@@ -69,6 +77,10 @@ public:
     [[nodiscard]] VkBuffer originBuffer() const noexcept { return m_origins.buffer; }
     [[nodiscard]] Stats stats() const;
 
+    // True once after the quad buffer was replaced by a bigger one: the
+    // renderer must point its descriptor at quadBuffer() again.
+    [[nodiscard]] bool consumeBufferChanged() noexcept { return std::exchange(m_bufferChanged, false); }
+
 private:
     struct Pending {
         u32 slot;
@@ -81,6 +93,9 @@ private:
     };
 
     void releaseSlot(u32 slot); // defer freeing until no in-flight frame uses it
+    // Replaces the quad buffer with one of at least `minQuads` capacity and
+    // re-packs every chunk's range into it. Waits for the GPU.
+    void grow(u64 minQuads);
 
     VulkanContext& m_ctx;
     u32 m_framesInFlight;
@@ -104,6 +119,8 @@ private:
     u32 m_chunks = 0;
     u64 m_quadCount = 0;
     u32 m_failed = 0;
+    u32 m_grows = 0;
+    bool m_bufferChanged = false;
 };
 
 } // namespace engine::render

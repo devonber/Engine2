@@ -21,7 +21,9 @@ ChunkMeshStore::ChunkMeshStore(VulkanContext& ctx, u64 quadCapacity, u32 maxChun
 {
     VmaAllocator allocator = ctx.allocator();
     m_quads = createBuffer(allocator, quadCapacity * kQuadBytes,
-                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemoryKind::GpuOnly);
+                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT, // source when growing
+                           MemoryKind::GpuOnly);
     m_origins =
         createBuffer(allocator, static_cast<VkDeviceSize>(maxChunks) * kOriginBytes,
                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemoryKind::GpuOnly);
@@ -75,14 +77,31 @@ bool ChunkMeshStore::set(u64 key, glm::ivec3 origin, std::span<const voxel::Pack
         const VmaVirtualAllocationCreateInfo allocInfo{.size = quads.size() * kQuadBytes, .alignment = kQuadBytes};
         VkDeviceSize offset = 0;
         if (vmaVirtualAllocate(m_quadBlock, &allocInfo, &slot.allocation, &offset) != VK_SUCCESS) {
-            m_freeSlots.push_back(index); // never seen by the GPU: reusable at once
-            ++m_failed;
-            return false;
+            // Full (or too fragmented): double the buffer and try again.
+            grow(std::max<u64>(2 * (m_quads.size / kQuadBytes), m_quadCount + quads.size()));
+            VK_CHECK(vmaVirtualAllocate(m_quadBlock, &allocInfo, &slot.allocation, &offset));
         }
         slot.firstQuad = static_cast<u32>(offset / kQuadBytes);
     }
+
+    // Group the quads by face direction (counting sort; the meshers already
+    // emit them in this order, so usually this is a straight copy).
+    std::array<u32, voxel::kFaceCount + 1> start{};
+    for (const voxel::PackedQuad& q : quads) {
+        ++start[static_cast<usize>(q.face()) + 1];
+    }
+    for (usize f = 0; f < voxel::kFaceCount; ++f) {
+        start[f + 1] += start[f];
+    }
+    std::vector<voxel::PackedQuad> sorted(quads.size());
+    std::array<u32, voxel::kFaceCount + 1> next = start;
+    for (const voxel::PackedQuad& q : quads) {
+        sorted[next[static_cast<usize>(q.face())]++] = q;
+    }
+
     slot.origin = origin;
     slot.quadCount = static_cast<u32>(quads.size());
+    slot.faceStart = start;
     slot.used = true;
     slot.drawable = false;
     ++slot.generation;
@@ -92,9 +111,60 @@ bool ChunkMeshStore::set(u64 key, glm::ivec3 origin, std::span<const voxel::Pack
     m_quadCount += slot.quadCount;
     if (!quads.empty()) {
         m_pendingBytes += quads.size() * kQuadBytes;
-        m_pending.push_back({index, slot.generation, std::vector<voxel::PackedQuad>(quads.begin(), quads.end())});
+        m_pending.push_back({index, slot.generation, std::move(sorted)});
     }
     return true;
+}
+
+void ChunkMeshStore::grow(u64 minQuads)
+{
+    ENGINE_PROFILE_FUNCTION();
+    VkDevice device = m_ctx.device();
+    vkDeviceWaitIdle(device); // nothing in flight reads the old buffer after this
+
+    // Everything deferred can go now that the GPU is idle.
+    for (u32 f = 0; f < m_framesInFlight; ++f) {
+        beginFrame(f);
+    }
+
+    const u64 newQuads = std::max<u64>(minQuads, 2 * (m_quads.size / kQuadBytes));
+    Buffer bigger = createBuffer(m_ctx.allocator(), newQuads * kQuadBytes,
+                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                 MemoryKind::GpuOnly);
+    VmaVirtualBlock block = VK_NULL_HANDLE;
+    const VmaVirtualBlockCreateInfo blockInfo{.size = newQuads * kQuadBytes};
+    VK_CHECK(vmaCreateVirtualBlock(&blockInfo, &block));
+
+    // Re-pack every live range into the new buffer (compacts it as a bonus).
+    std::vector<VkBufferCopy> copies;
+    for (u32 i = 0; i < m_highWater; ++i) {
+        Slot& slot = m_slots[i];
+        if (!slot.used || slot.allocation == VK_NULL_HANDLE) {
+            continue;
+        }
+        const VkDeviceSize bytes = static_cast<VkDeviceSize>(slot.quadCount) * kQuadBytes;
+        const VmaVirtualAllocationCreateInfo allocInfo{.size = bytes, .alignment = kQuadBytes};
+        VkDeviceSize offset = 0;
+        VK_CHECK(vmaVirtualAllocate(block, &allocInfo, &slot.allocation, &offset));
+        if (slot.drawable) { // not-yet-uploaded meshes are copied in later, to the new place
+            copies.push_back({static_cast<VkDeviceSize>(slot.firstQuad) * kQuadBytes, offset, bytes});
+        }
+        slot.firstQuad = static_cast<u32>(offset / kQuadBytes);
+    }
+    if (!copies.empty()) {
+        m_ctx.immediateSubmit([&](VkCommandBuffer cmd) {
+            vkCmdCopyBuffer(cmd, m_quads.buffer, bigger.buffer, static_cast<u32>(copies.size()), copies.data());
+        });
+    }
+
+    vmaClearVirtualBlock(m_quadBlock);
+    vmaDestroyVirtualBlock(m_quadBlock);
+    destroyBuffer(m_ctx.allocator(), m_quads);
+    m_quads = bigger;
+    m_quadBlock = block;
+    m_bufferChanged = true;
+    ++m_grows;
 }
 
 void ChunkMeshStore::remove(u64 key)
@@ -214,7 +284,7 @@ ChunkMeshStore::Stats ChunkMeshStore::stats() const
 {
     VmaStatistics vs{};
     vmaGetVirtualBlockStatistics(m_quadBlock, &vs);
-    return {m_chunks, m_quadCount, vs.allocationBytes, vs.blockBytes, m_pendingBytes, m_failed};
+    return {m_chunks, m_quadCount, vs.allocationBytes, vs.blockBytes, m_pendingBytes, m_failed, m_grows};
 }
 
 } // namespace engine::render

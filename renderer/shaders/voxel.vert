@@ -14,9 +14,10 @@ layout(std430, set = 0, binding = 1) readonly buffer ChunkBuffer { ivec4 chunkOr
 layout(std430, set = 0, binding = 3) readonly buffer FaceLayerBuffer { uint faceLayers[]; }; // [block * 6 + face]
 
 layout(push_constant) uniform PushConstants {
-    mat4 viewProj;
-    vec4 cameraPos; // xyz
-    vec4 fog;       // rgb = colour (linear), a = distance of full fog
+    mat4 viewProj;       // projection * rotation: the camera sits at the origin
+    ivec4 cameraBlock;   // xyz: integer block containing the camera
+    vec4 cameraFraction; // xyz: camera position within that block
+    vec4 fog;            // rgb = colour (linear), a = distance of full fog
 } pc;
 
 layout(location = 0) out vec2 outUV;
@@ -81,15 +82,17 @@ void main()
     // Greedy-merged quads cover width x height block faces.
     const vec2 size = vec2(float(((q.x >> 21) & 31u) + 1u), float(((q.x >> 26) & 31u) + 1u));
 
-    const ivec3 voxel = chunkOrigins[gl_InstanceIndex].xyz + ivec3(local);
+    // Camera-relative: the integer part is exact, so precision does not
+    // depend on how far from the world origin the camera is.
+    const ivec3 voxel = chunkOrigins[gl_InstanceIndex].xyz + ivec3(local) - pc.cameraBlock.xyz;
     const vec2 corner2 = vec2(float(corner & 1u), float(corner >> 1));
     const vec3 inBlock = kBase[face] + kU[face] * (corner2.x * size.x) + kV[face] * (corner2.y * size.y);
-    const vec3 pos = vec3(voxel) + inBlock;
+    const vec3 pos = vec3(voxel) - pc.cameraFraction.xyz + inBlock; // relative to the camera
     gl_Position = pc.viewProj * vec4(pos, 1.0);
 
     outUV = faceUV(face, inBlock);
     outLayer = faceLayers[block * 6u + face];
     outShade = kShade[face];
     outOcclusion = kOcclusion[(aoBits >> (2u * corner)) & 3u];
-    outDistance = distance(pos, pc.cameraPos.xyz);
+    outDistance = length(pos);
 }

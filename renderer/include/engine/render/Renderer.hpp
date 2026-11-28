@@ -26,15 +26,18 @@ struct RendererDesc {
     f32 fogDistance = 300.0f; // blocks
 
     // Chunk mesh storage (fixed at start-up).
-    u32 maxChunks = 16384;                    // resident chunk meshes
-    u64 quadCapacity = 8u * 1024 * 1024;      // quads in the shared buffer (8 bytes each: 64 MiB)
+    u32 maxChunks = 65536;                    // resident chunk meshes
+    u64 quadCapacity = 8u * 1024 * 1024;      // initial quads in the shared buffer (8 bytes each: 64 MiB); grows
     u64 uploadBudgetBytes = 4u * 1024 * 1024; // mesh data copied to the GPU per frame, at most
+    bool faceCulling = true;                  // skip each chunk's face directions that point away from the camera
 };
 
 struct FrameStats {
-    f64 gpuMs = 0.0; // GPU time of the most recently completed frame
-    u32 drawnChunks = 0;
+    f64 gpuMs = 0.0;     // GPU time of the most recently completed frame
+    u32 drawnChunks = 0; // chunks that passed frustum/distance culling
+    u32 draws = 0;       // indirect draws (up to 3 per chunk: runs of face directions)
     u64 drawnQuads = 0;
+    f64 cullMs = 0.0;      // CPU time culling chunks and writing the draws
     u64 uploadedBytes = 0; // mesh data copied to the GPU this frame
 };
 
@@ -44,7 +47,8 @@ struct MeshMemoryStats {
     u64 usedBytes = 0;
     u64 capacityBytes = 0;
     u64 pendingBytes = 0; // waiting for upload budget
-    u32 failed = 0;       // meshes rejected: quad buffer or chunk slots full
+    u32 failed = 0;       // meshes rejected: all chunk slots in use
+    u32 grows = 0;        // times the quad buffer was enlarged (each stalls the GPU once)
 };
 
 class ChunkMeshStore;
@@ -91,7 +95,7 @@ private:
     void createIndexBuffer();
     void destroyTextures();
     void recreateSwapchain();
-    [[nodiscard]] u32 cullAndWriteDraws(Frame& frame, const Camera& camera, u64& drawnQuads) const;
+    [[nodiscard]] u32 cullAndWriteDraws(Frame& frame, const Camera& camera, FrameStats& stats) const;
     [[nodiscard]] VkDeviceSize recordFrame(Frame& frame, u32 imageIndex, u32 drawCount, const Camera& camera,
                                            bool screenshot);
     void writeScreenshot();
