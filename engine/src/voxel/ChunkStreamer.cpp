@@ -16,14 +16,6 @@ namespace {
 
 constexpr std::align_val_t kChunkAlign{64};
 
-// Horizontal neighbours.
-constexpr std::pair<Face, std::pair<i32, i32>> kSideNeighbours[] = {
-    {Face::PosX, {+1, 0}},
-    {Face::NegX, {-1, 0}},
-    {Face::PosZ, {0, +1}},
-    {Face::NegZ, {0, -1}},
-};
-
 // Shared read-only data for uniform stone chunks, so meshing one needs no
 // storage of its own.
 const Chunk& stoneChunk()
@@ -106,7 +98,10 @@ ChunkStreamer::ChunkStreamer(ThreadPool& pool, const StreamingOptions& options) 
     m_maxInFlight = m_options.maxJobsInFlight != 0 ? m_options.maxJobsInFlight : 32 * pool.concurrency();
 
     // Every offset within the generation radius, nearest first.
-    const i32 r = m_options.viewRadius + 1;
+    // Generate within viewRadius + 2: a meshed chunk (within viewRadius)
+    // needs all 8 surrounding columns, and the diagonal ones are up to
+    // sqrt(2) further out.
+    const i32 r = m_options.viewRadius + 2;
     for (i32 dz = -r; dz <= r; ++dz) {
         for (i32 dx = -r; dx <= r; ++dx) {
             if (dx * dx + dz * dz <= r * r) {
@@ -251,7 +246,7 @@ void ChunkStreamer::unloadFar()
 {
     ENGINE_PROFILE_FUNCTION();
     const i64 unmesh = m_options.viewRadius + 1;
-    const i64 unload = m_options.viewRadius + 2;
+    const i64 unload = m_options.viewRadius + 3;
     for (auto it = m_columns.begin(); it != m_columns.end();) {
         Column& col = it->second;
         const i64 d2 = distanceSq(col.coord);
@@ -319,10 +314,12 @@ void ChunkStreamer::schedule()
         if (col->allMeshed || static_cast<i64>(dx) * dx + static_cast<i64>(dz) * dz > meshRadiusSq) {
             continue; // done, or in the generate-only outer ring
         }
-        bool neighboursReady = true;
-        for (const auto& [face, d] : kSideNeighbours) {
-            const Column* n = find({coord.x + d.first, coord.z + d.second});
-            neighboursReady &= n != nullptr && n->state == State::Ready;
+        bool neighboursReady = true; // all 8 surrounding columns (ambient occlusion needs the diagonals)
+        for (i32 nz = -1; nz <= 1; ++nz) {
+            for (i32 nx = -1; nx <= 1; ++nx) {
+                const Column* n = find({coord.x + nx, coord.z + nz});
+                neighboursReady &= n != nullptr && n->state == State::Ready;
+            }
         }
         if (!neighboursReady) {
             workLeft = true; // they are nearer the edge: generated soon
@@ -388,10 +385,12 @@ void ChunkStreamer::submitGenerate(ColumnCoord coord)
 
 bool ChunkStreamer::scheduleMeshes(Column& col)
 {
-    std::array<const Column*, 4> side{};
-    for (usize s = 0; s < 4; ++s) {
-        const auto [dx, dz] = kSideNeighbours[s].second;
-        side[s] = find({col.coord.x + dx, col.coord.z + dz});
+    // The 3 x 3 columns around and including this one, [dx + 1 + 3 * (dz + 1)].
+    std::array<const Column*, 9> around{};
+    for (i32 dz = -1; dz <= 1; ++dz) {
+        for (i32 dx = -1; dx <= 1; ++dx) {
+            around[static_cast<usize>((dx + 1) + 3 * (dz + 1))] = find({col.coord.x + dx, col.coord.z + dz});
+        }
     }
 
     bool budgetLeft = true;
@@ -405,19 +404,28 @@ bool ChunkStreamer::scheduleMeshes(Column& col)
             continue;
         }
 
-        // Boundary masks from the neighbours' outer layers, built here so the
-        // job never touches neighbour chunk memory.
-        std::array<const OuterLayers*, kFaceCount> nb{};
-        for (usize s = 0; s < 4; ++s) {
-            nb[static_cast<usize>(kSideNeighbours[s].first)] = &side[s]->chunks[i].outer;
+        // The one-voxel shell around the chunk from its 26 neighbours' outer
+        // layers, built here so the job never touches neighbour chunk memory.
+        // Below the world is solid, above it air.
+        std::array<const OuterLayers*, kNeighbourhoodSize> nb{};
+        for (i32 dz = -1; dz <= 1; ++dz) {
+            for (i32 dy = -1; dy <= 1; ++dy) {
+                for (i32 dx = -1; dx <= 1; ++dx) {
+                    const i32 layer = static_cast<i32>(i) + dy;
+                    const OuterLayers* layers = nullptr;
+                    if (layer < 0) {
+                        layers = &solidOuterLayers();
+                    } else if (layer < static_cast<i32>(kLayers)) {
+                        layers = &around[static_cast<usize>((dx + 1) + 3 * (dz + 1))]
+                                      ->chunks[static_cast<usize>(layer)]
+                                      .outer;
+                    }
+                    nb[neighbourIndex(dx, dy, dz)] = layers;
+                }
+            }
         }
-        nb[static_cast<usize>(Face::PosY)] = i + 1 < kLayers ? &col.chunks[i + 1].outer : nullptr; // top: air
-        nb[static_cast<usize>(Face::NegY)] = i > 0 ? &col.chunks[i - 1].outer : nullptr;
-        BoundaryMasks masks = boundaryFromNeighbours(nb);
-        if (i == 0) {
-            masks.setSolid(Face::NegY); // nothing is ever seen below the world
-        }
-        if (cs.content == ChunkContent::Stone && allSolid(masks)) {
+        const NeighbourShell shell = shellFromOuterLayers(nb);
+        if (cs.content == ChunkContent::Stone && allSolid(shell.faces)) {
             cs.meshed = true; // buried: no visible faces
             continue;
         }
@@ -437,13 +445,14 @@ bool ChunkStreamer::scheduleMeshes(Column& col)
             out = std::move(m_spareMeshes.back());
             m_spareMeshes.pop_back();
         }
-        m_batch.emplace_back([this, coord = col.coord, layer = static_cast<i32>(i), chunk, masks,
-                              greedy = m_options.greedy, out = std::move(out)]() mutable {
+        m_batch.emplace_back([this, coord = col.coord, layer = static_cast<i32>(i), chunk, shell,
+                              greedy = m_options.greedy, ao = m_options.ambientOcclusion,
+                              out = std::move(out)]() mutable {
             ENGINE_PROFILE_SCOPE("mesh chunk");
             if (greedy) {
-                meshChunkGreedy(*chunk, masks, out);
+                meshChunkGreedy(*chunk, shell, out, ao);
             } else {
-                meshChunkBinary(*chunk, masks, out);
+                meshChunkBinary(*chunk, shell, out, ao);
             }
             finish({.column = coord, .layer = layer, .quads = std::move(out)});
         });

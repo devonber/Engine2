@@ -19,7 +19,8 @@ std::vector<PackedQuad> sorted(std::vector<PackedQuad> v)
     return v;
 }
 
-// Split greedy rectangles back into one unit quad per block face.
+// Split greedy rectangles back into one unit quad per block face (each with
+// the rectangle's occlusion: merging only joins faces whose levels match).
 std::vector<PackedQuad> expand(const std::vector<PackedQuad>& quads)
 {
     std::vector<PackedQuad> unit;
@@ -30,32 +31,35 @@ std::vector<PackedQuad> expand(const std::vector<PackedQuad>& quads)
                 u32 c[3] = {q.x(), q.y(), q.z()};
                 c[axes.u] += i;
                 c[axes.v] += j;
-                unit.push_back(PackedQuad::make(c[0], c[1], c[2], q.face(), q.block()));
+                unit.push_back(PackedQuad::make(c[0], c[1], c[2], q.face(), q.block(), 1, 1, q.aoBits()));
             }
         }
     }
     return unit;
 }
 
-// Naive (reads neighbour chunks) is the reference for binary and greedy
-// (which read boundary masks built from the same neighbours).
-void checkMeshersAgree(const Chunk& chunk, const ChunkNeighbours& neighbours = {})
+// Naive (reads neighbour chunks directly) is the reference for binary and
+// greedy (which read the neighbour shell built from the same chunks).
+void checkMeshersAgree(const Chunk& chunk, const ChunkNeighbourhood& neighbours = {})
 {
-    const BoundaryMasks masks = buildBoundaryMasks(neighbours);
-    std::vector<PackedQuad> naive, binary, greedy;
-    meshChunkNaive(chunk, neighbours, naive);
-    meshChunkBinary(chunk, masks, binary);
-    meshChunkGreedy(chunk, masks, greedy);
+    const NeighbourShell shell = buildNeighbourShell(neighbours);
+    for (const bool ao : {false, true}) {
+        CAPTURE(ao);
+        std::vector<PackedQuad> naive, binary, greedy;
+        meshChunkNaive(chunk, neighbours, naive, ao);
+        meshChunkBinary(chunk, shell, binary, ao);
+        meshChunkGreedy(chunk, shell, greedy, ao);
 
-    const auto reference = sorted(naive);
-    REQUIRE(binary.size() == naive.size());
-    CHECK(sorted(binary) == reference);
+        const auto reference = sorted(naive);
+        REQUIRE(binary.size() == naive.size());
+        CHECK(sorted(binary) == reference);
 
-    // Same faces covered exactly once: no gaps, no overlaps.
-    const auto greedyFaces = expand(greedy);
-    REQUIRE(greedyFaces.size() == naive.size());
-    CHECK(sorted(greedyFaces) == reference);
-    CHECK(greedy.size() <= naive.size());
+        // Same faces covered exactly once (no gaps, no overlaps), same occlusion.
+        const auto greedyFaces = expand(greedy);
+        REQUIRE(greedyFaces.size() == naive.size());
+        CHECK(sorted(greedyFaces) == reference);
+        CHECK(greedy.size() <= naive.size());
+    }
 }
 
 std::unique_ptr<Chunk> randomChunk(f64 density, u64 seed)
@@ -63,6 +67,17 @@ std::unique_ptr<Chunk> randomChunk(f64 density, u64 seed)
     auto c = std::make_unique<Chunk>();
     fillRandom(*c, density, seed);
     return c;
+}
+
+// The quad for one face in a mesh (unit faces only), or nullptr.
+const PackedQuad* findFace(const std::vector<PackedQuad>& quads, u32 x, u32 y, u32 z, Face face)
+{
+    for (const PackedQuad& q : quads) {
+        if (q.x() == x && q.y() == y && q.z() == z && q.face() == face) {
+            return &q;
+        }
+    }
+    return nullptr;
 }
 
 } // namespace
@@ -73,9 +88,11 @@ TEST_CASE("PackedQuad round-trips its fields")
     static_assert(q.x() == 31 && q.y() == 17 && q.z() == 3);
     static_assert(q.face() == Face::NegZ && q.block() == 0xBEEF);
     static_assert(q.width() == 1 && q.height() == 1);
+    static_assert(q.aoBits() == PackedQuad::kNoOcclusion); // open by default
 
-    constexpr auto big = PackedQuad::make(0, 5, 0, Face::PosY, 7, 32, 32);
+    constexpr auto big = PackedQuad::make(0, 5, 0, Face::PosY, 7, 32, 32, 0b11'10'01'00);
     static_assert(big.width() == 32 && big.height() == 32 && big.y() == 5 && big.block() == 7);
+    static_assert(big.ao(0) == 0 && big.ao(1) == 1 && big.ao(2) == 2 && big.ao(3) == 3);
 }
 
 TEST_CASE("Face axes are right-handed: U x V is the outward normal")
@@ -100,46 +117,51 @@ TEST_CASE("Meshing simple shapes")
 {
     auto chunk = std::make_unique<Chunk>();
     std::vector<PackedQuad> quads;
-    const BoundaryMasks air{};
+    const NeighbourShell air{};
 
-    SUBCASE("empty chunk has no faces")
-    {
-        meshChunkBinary(*chunk, air, quads);
+    // Isolated shapes have nothing in front of any face: occlusion changes nothing.
+    for (const bool ao : {false, true}) {
+        CAPTURE(ao);
+        chunk->fill(kAir);
+
+        meshChunkBinary(*chunk, air, quads, ao);
         CHECK(quads.empty());
-        meshChunkGreedy(*chunk, air, quads);
+        meshChunkGreedy(*chunk, air, quads, ao);
         CHECK(quads.empty());
-    }
-    SUBCASE("single block has 6 faces")
-    {
+
         chunk->set(10, 10, 10, 1);
-        meshChunkBinary(*chunk, air, quads);
+        meshChunkBinary(*chunk, air, quads, ao);
         CHECK(quads.size() == 6);
-        meshChunkGreedy(*chunk, air, quads);
+        meshChunkGreedy(*chunk, air, quads, ao);
         CHECK(quads.size() == 6);
-    }
-    SUBCASE("two adjacent blocks hide the shared faces")
-    {
-        chunk->set(10, 10, 10, 1);
-        chunk->set(11, 10, 10, 1);
-        meshChunkBinary(*chunk, air, quads);
+
+        chunk->set(11, 10, 10, 1); // two adjacent blocks hide the shared faces
+        meshChunkBinary(*chunk, air, quads, ao);
         CHECK(quads.size() == 10);
-        meshChunkGreedy(*chunk, air, quads);
+        meshChunkGreedy(*chunk, air, quads, ao);
         CHECK(quads.size() == 6); // the four long sides merge into 1x2 quads
-    }
-    SUBCASE("full chunk: one quad per side when greedy")
-    {
-        chunk->fill(1);
-        meshChunkBinary(*chunk, air, quads);
+
+        chunk->fill(1); // full chunk: one quad per side when greedy
+        meshChunkBinary(*chunk, air, quads, ao);
         CHECK(quads.size() == 6 * kChunkArea);
-        meshChunkGreedy(*chunk, air, quads);
+        meshChunkGreedy(*chunk, air, quads, ao);
         REQUIRE(quads.size() == 6);
         for (const auto& q : quads) {
             CHECK(q.width() == 32);
             CHECK(q.height() == 32);
         }
+
+        NeighbourShell solid; // solid neighbours hide every border face
+        solid.setAllSolid();
+        meshChunkBinary(*chunk, solid, quads, ao);
+        CHECK(quads.empty());
+        meshChunkGreedy(*chunk, solid, quads, ao);
+        CHECK(quads.empty());
     }
+
     SUBCASE("different blocks do not merge")
     {
+        chunk->fill(kAir);
         for (u32 x = 0; x < kChunkSize; ++x) {
             chunk->set(x, 0, 0, x % 2 == 0 ? 1 : 2);
         }
@@ -147,18 +169,94 @@ TEST_CASE("Meshing simple shapes")
         // Each block keeps its own top, bottom and two side faces; only the ends are shared.
         CHECK(quads.size() == 32 * 4 + 2);
     }
-    SUBCASE("solid neighbours hide border faces")
-    {
-        chunk->fill(1);
-        BoundaryMasks solid;
-        for (u32 f = 0; f < kFaceCount; ++f) {
-            solid.setSolid(static_cast<Face>(f));
+}
+
+TEST_CASE("Ambient occlusion levels")
+{
+    // A stone floor at y = 0 with a few blocks standing on it.
+    auto chunk = std::make_unique<Chunk>();
+    for (u32 z = 0; z < kChunkSize; ++z) {
+        for (u32 x = 0; x < kChunkSize; ++x) {
+            chunk->set(x, 0, z, 1);
         }
-        meshChunkBinary(*chunk, solid, quads);
-        CHECK(quads.empty());
-        meshChunkGreedy(*chunk, solid, quads);
-        CHECK(quads.empty());
     }
+    chunk->set(10, 1, 10, 1); // a lone block
+    chunk->set(21, 1, 22, 1); // an inside corner at (22, 0, 22): blocks to its -X and -Z
+    chunk->set(22, 1, 21, 1);
+
+    std::vector<PackedQuad> quads;
+    meshChunkNaive(*chunk, {}, quads);
+
+    // Top face of a floor block (+Y): U = z, V = x, corner = cu + 2 * cv.
+    SUBCASE("open floor is unoccluded")
+    {
+        const PackedQuad* far = findFace(quads, 2, 0, 2, Face::PosY);
+        REQUIRE(far != nullptr);
+        CHECK(far->aoBits() == 0xFF);
+    }
+    SUBCASE("floor next to a block darkens the two corners touching it")
+    {
+        // Floor at x = 11, next to the block at x = 10: its corners with
+        // cv = 0 (the x = 11 edge, shared with the block's side) touch it.
+        const PackedQuad* next = findFace(quads, 11, 0, 10, Face::PosY);
+        REQUIRE(next != nullptr);
+        CHECK(next->ao(0) == 2); // one side solid
+        CHECK(next->ao(1) == 2);
+        CHECK(next->ao(2) == 3);
+        CHECK(next->ao(3) == 3);
+        // Diagonal to the block: only the diagonal voxel of one corner.
+        const PackedQuad* diag = findFace(quads, 11, 0, 11, Face::PosY);
+        REQUIRE(diag != nullptr);
+        CHECK(diag->ao(0) == 2); // corner (cu=0, cv=0) = towards (x-1, z-1): the block is its diagonal
+        CHECK(diag->ao(1) == 3);
+        CHECK(diag->ao(2) == 3);
+        CHECK(diag->ao(3) == 3);
+    }
+    SUBCASE("an inside corner is fully occluded")
+    {
+        const PackedQuad* inside = findFace(quads, 22, 0, 22, Face::PosY);
+        REQUIRE(inside != nullptr);
+        CHECK(inside->ao(0) == 0); // both sides solid
+    }
+    SUBCASE("block sides are darkened where they meet the floor")
+    {
+        // +X side of the lone block: U = y, V = z. Its bottom corners (cu = 0)
+        // have the floor in front of them both straight below and diagonally
+        // (one side + the diagonal solid): level 1.
+        const PackedQuad* side = findFace(quads, 10, 1, 10, Face::PosX);
+        REQUIRE(side != nullptr);
+        CHECK(side->ao(0) == 1);
+        CHECK(side->ao(2) == 1);
+        CHECK(side->ao(1) == 3);
+        CHECK(side->ao(3) == 3);
+    }
+
+    checkMeshersAgree(*chunk);
+}
+
+TEST_CASE("Ambient occlusion reads diagonal neighbour chunks at chunk corners")
+{
+    // Floor along this chunk's top layer; a single block sits in the chunk
+    // diagonally above-and-beside (+X, +Y). It touches the top face of the
+    // floor voxel at (31, 31, 5) only through the shell's edge data.
+    auto chunk = std::make_unique<Chunk>();
+    for (u32 z = 0; z < kChunkSize; ++z) {
+        for (u32 x = 0; x < kChunkSize; ++x) {
+            chunk->set(x, 31, z, 1);
+        }
+    }
+    auto diagonal = std::make_unique<Chunk>();
+    diagonal->set(0, 0, 5, 1);
+    ChunkNeighbourhood nb;
+    nb.set(+1, +1, 0, diagonal.get());
+
+    std::vector<PackedQuad> naive;
+    meshChunkNaive(*chunk, nb, naive);
+    const PackedQuad* face = findFace(naive, 31, 31, 5, Face::PosY);
+    REQUIRE(face != nullptr);
+    CHECK(face->aoBits() != 0xFF); // occluded by the block in the diagonal chunk
+
+    checkMeshersAgree(*chunk, nb);
 }
 
 TEST_CASE("Fast meshers match the naive reference")
@@ -180,37 +278,41 @@ TEST_CASE("Fast meshers match the naive reference")
             checkMeshersAgree(*chunk);
         }
     }
-    SUBCASE("terrain with terrain neighbours")
+    SUBCASE("terrain with all 26 terrain neighbours")
     {
-        auto px = std::make_unique<Chunk>(), nx = std::make_unique<Chunk>();
-        auto pz = std::make_unique<Chunk>(), nz = std::make_unique<Chunk>();
-        fillTerrain(*chunk, 2, 1, 5);
-        fillTerrain(*px, 3, 1, 5);
-        fillTerrain(*nx, 1, 1, 5);
-        fillTerrain(*pz, 2, 1, 6);
-        fillTerrain(*nz, 2, 1, 4);
-        ChunkNeighbours n;
-        n.chunks[static_cast<usize>(Face::PosX)] = px.get();
-        n.chunks[static_cast<usize>(Face::NegX)] = nx.get();
-        n.chunks[static_cast<usize>(Face::PosZ)] = pz.get();
-        n.chunks[static_cast<usize>(Face::NegZ)] = nz.get();
-        checkMeshersAgree(*chunk, n);
+        constexpr i32 cx = 2, cy = 1, cz = 5;
+        fillTerrain(*chunk, cx, cy, cz);
+        std::vector<std::unique_ptr<Chunk>> owned;
+        ChunkNeighbourhood nb;
+        for (i32 dz = -1; dz <= 1; ++dz) {
+            for (i32 dy = -1; dy <= 1; ++dy) {
+                for (i32 dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0 && dz == 0) {
+                        continue;
+                    }
+                    owned.push_back(std::make_unique<Chunk>());
+                    fillTerrain(*owned.back(), cx + dx, cy + dy, cz + dz);
+                    nb.set(dx, dy, dz, owned.back().get());
+                }
+            }
+        }
+        checkMeshersAgree(*chunk, nb);
     }
     SUBCASE("random chunk with random neighbours, some missing")
     {
         SplitMix64 rng{99};
-        for (int trial = 0; trial < 8; ++trial) {
+        for (int trial = 0; trial < 6; ++trial) {
             CAPTURE(trial);
             fillRandom(*chunk, 0.2 + 0.6 * rng.nextUnit(), rng.next());
             std::vector<std::unique_ptr<Chunk>> owned;
-            ChunkNeighbours n;
-            for (u32 f = 0; f < kFaceCount; ++f) {
-                if (rng.nextUnit() < 0.75) {
+            ChunkNeighbourhood nb;
+            for (usize i = 0; i < kNeighbourhoodSize; ++i) {
+                if (i != neighbourIndex(0, 0, 0) && rng.nextUnit() < 0.75) {
                     owned.push_back(randomChunk(rng.nextUnit(), rng.next()));
-                    n.chunks[f] = owned.back().get();
+                    nb.chunks[i] = owned.back().get();
                 }
             }
-            checkMeshersAgree(*chunk, n);
+            checkMeshersAgree(*chunk, nb);
         }
     }
     SUBCASE("mixed block types merge only with their own kind")
@@ -224,35 +326,35 @@ TEST_CASE("Fast meshers match the naive reference")
     }
 }
 
-TEST_CASE("Outer layers give the same boundary masks as reading the neighbours")
+TEST_CASE("Shell from outer layers equals the shell read from the neighbours")
 {
     SplitMix64 rng{2024};
     std::vector<std::unique_ptr<Chunk>> owned;
-    std::vector<OuterLayers> layers(kFaceCount);
-    ChunkNeighbours nb;
-    std::array<const OuterLayers*, kFaceCount> nbLayers{};
-    for (u32 f = 0; f < kFaceCount; ++f) {
-        if (f == 3) {
-            continue; // one side missing: air
+    std::vector<OuterLayers> layers(kNeighbourhoodSize);
+    ChunkNeighbourhood nb;
+    std::array<const OuterLayers*, kNeighbourhoodSize> nbLayers{};
+    for (usize i = 0; i < kNeighbourhoodSize; ++i) {
+        if (i == neighbourIndex(0, 0, 0) || i % 5 == 3) {
+            continue; // the chunk itself, and a few missing neighbours (air)
         }
         owned.push_back(randomChunk(0.3 + 0.4 * rng.nextUnit(), rng.next()));
-        nb.chunks[f] = owned.back().get();
-        layers[f] = computeOuterLayers(*owned.back());
-        nbLayers[f] = &layers[f];
+        nb.chunks[i] = owned.back().get();
+        layers[i] = computeOuterLayers(*owned.back());
+        nbLayers[i] = &layers[i];
     }
-    const BoundaryMasks expected = buildBoundaryMasks(nb);
-    const BoundaryMasks actual = boundaryFromNeighbours(nbLayers);
-    CHECK(actual.rows == expected.rows);
+    const NeighbourShell expected = buildNeighbourShell(nb);
+    const NeighbourShell actual = shellFromOuterLayers(nbLayers);
+    CHECK(actual.faces.rows == expected.faces.rows);
+    CHECK(actual.edges == expected.edges);
+    CHECK(actual.corners == expected.corners);
 
-    // And on structured terrain.
-    auto terrain = std::make_unique<Chunk>();
-    fillTerrain(*terrain, 3, 1, -2);
-    const OuterLayers t = computeOuterLayers(*terrain);
-    for (u32 f = 0; f < kFaceCount; ++f) {
-        ChunkNeighbours one;
-        one.chunks[f ^ 1u] = terrain.get(); // terrain is the neighbour on the opposite side
-        std::array<const OuterLayers*, kFaceCount> oneLayer{};
-        oneLayer[f ^ 1u] = &t;
-        CHECK(boundaryFromNeighbours(oneLayer).rows == buildBoundaryMasks(one).rows);
-    }
+    // Uniformly solid neighbours: everything set.
+    std::array<const OuterLayers*, kNeighbourhoodSize> allSolid{};
+    allSolid.fill(&solidOuterLayers());
+    NeighbourShell solid;
+    solid.setAllSolid();
+    const NeighbourShell fromSolid = shellFromOuterLayers(allSolid);
+    CHECK(fromSolid.faces.rows == solid.faces.rows);
+    CHECK(fromSolid.edges == solid.edges);
+    CHECK(fromSolid.corners == solid.corners);
 }

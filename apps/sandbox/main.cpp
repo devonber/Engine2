@@ -11,6 +11,7 @@
 //           --frames N        quit N frames after the initial area has loaded (automated runs)
 //           --screenshot F    save the last of those frames (or frame 60) to F (.bmp)
 //           --fly SPEED       fly forward automatically at SPEED blocks/s once loaded
+//           --no-ao           turn ambient occlusion off (for comparison)
 //           --camera x,y,z,yaw,pitch   start position (yaw/pitch in degrees)
 //           --assets DIR      asset folder (default: <repo>/assets)
 //           --mesher M        greedy (default) or binary (one quad per block face)
@@ -48,6 +49,7 @@ struct Options {
     std::string screenshot;
     std::string assets = ENGINE_ASSET_DIR;
     bool greedy = true;
+    bool ao = true;
     u32 threads = 0; // 0 = all hardware threads
     f32 fly = 0.0f;
     f32 camera[5] = {0.0f, 90.0f, 40.0f, 0.0f, -20.0f};
@@ -75,6 +77,8 @@ Options parseArgs(int argc, char** argv)
             o.greedy = std::strcmp(next(), "binary") != 0;
         } else if (arg("--threads")) {
             o.threads = static_cast<u32>(std::clamp(std::atoi(next()), 0, 256));
+        } else if (arg("--no-ao")) {
+            o.ao = false;
         } else if (arg("--fly")) {
             o.fly = static_cast<f32>(std::atof(next()));
         } else if (arg("--assets")) {
@@ -146,7 +150,7 @@ int main(int argc, char** argv)
     // Background workers for generation and meshing. --threads counts the
     // main thread too, so the pool gets one fewer.
     ThreadPool pool(opt.threads == 0 ? 0u : std::max(opt.threads, 2u) - 1);
-    voxel::ChunkStreamer streamer(pool, {.viewRadius = opt.radius, .greedy = opt.greedy});
+    voxel::ChunkStreamer streamer(pool, {.viewRadius = opt.radius, .greedy = opt.greedy, .ambientOcclusion = opt.ao});
     std::fprintf(stderr, "Streaming: view radius %d chunks, %u worker threads, %s meshing\n", opt.radius,
                  pool.workerCount(), opt.greedy ? "greedy" : "binary");
 
