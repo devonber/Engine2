@@ -51,7 +51,8 @@ bool hasDeviceExtension(VkPhysicalDevice device, const char* name)
 // Features the renderer relies on. Checked during device selection and then
 // enabled on the device.
 struct RequiredFeatures {
-    VkPhysicalDeviceVulkan13Features v13{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features v12{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan13Features v13{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = &v12};
     VkPhysicalDeviceFeatures2 core{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v13};
 
     RequiredFeatures() = default;
@@ -227,13 +228,16 @@ void VulkanContext::createDevice()
         .pQueuePriorities = &priority,
     };
 
-    VkPhysicalDeviceFeatures available;
-    vkGetPhysicalDeviceFeatures(m_physicalDevice, &available);
-    m_samplerAnisotropy = available.samplerAnisotropy == VK_TRUE; // optional; universal on desktop
+    // Optional features (universal on desktop GPUs, but checked).
+    RequiredFeatures available;
+    static_cast<void>(available.supportedBy(m_physicalDevice)); // fills in everything the device has
+    m_samplerAnisotropy = available.core.features.samplerAnisotropy == VK_TRUE;
+    m_drawIndirectCount = available.v12.drawIndirectCount == VK_TRUE; // GPU-driven culling
 
     RequiredFeatures features;
     features.setRequired();
-    features.core.features.samplerAnisotropy = available.samplerAnisotropy;
+    features.core.features.samplerAnisotropy = available.core.features.samplerAnisotropy;
+    features.v12.drawIndirectCount = available.v12.drawIndirectCount;
     const char* extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
     const VkDeviceCreateInfo info{

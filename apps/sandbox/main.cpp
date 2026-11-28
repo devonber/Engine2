@@ -13,6 +13,7 @@
 //           --fly SPEED       fly forward automatically at SPEED blocks/s once loaded
 //           --no-ao           turn ambient occlusion off (for comparison)
 //           --no-face-culling draw back-facing face directions too (for comparison)
+//           --cpu-culling     cull chunks on the CPU instead of the GPU (for comparison)
 //           --mesh-memory MiB initial GPU mesh buffer size (grows as needed; default 64)
 //           --camera x,y,z,yaw,pitch   start position (yaw/pitch in degrees)
 //           --assets DIR      asset folder (default: <repo>/assets)
@@ -53,6 +54,7 @@ struct Options {
     bool greedy = true;
     bool ao = true;
     bool faceCulling = true;
+    bool gpuCulling = true;
     u32 meshMemoryMiB = 64;
     u32 threads = 0; // 0 = all hardware threads
     f32 fly = 0.0f;
@@ -81,6 +83,8 @@ Options parseArgs(int argc, char** argv)
             o.greedy = std::strcmp(next(), "binary") != 0;
         } else if (arg("--threads")) {
             o.threads = static_cast<u32>(std::clamp(std::atoi(next()), 0, 256));
+        } else if (arg("--cpu-culling")) {
+            o.gpuCulling = false;
         } else if (arg("--no-face-culling")) {
             o.faceCulling = false;
         } else if (arg("--mesh-memory")) {
@@ -145,6 +149,7 @@ int main(int argc, char** argv)
                                   .fogDistance = static_cast<f32>(opt.radius) * 32.0f * 0.95f,
                                   .quadCapacity = static_cast<u64>(opt.meshMemoryMiB) * 1024 * 1024 / 8,
                                   .faceCulling = opt.faceCulling,
+                                  .gpuCulling = opt.gpuCulling,
                               });
 
     using Clock = std::chrono::steady_clock;
@@ -161,6 +166,7 @@ int main(int argc, char** argv)
     // main thread too, so the pool gets one fewer.
     ThreadPool pool(opt.threads == 0 ? 0u : std::max(opt.threads, 2u) - 1);
     voxel::ChunkStreamer streamer(pool, {.viewRadius = opt.radius, .greedy = opt.greedy, .ambientOcclusion = opt.ao});
+    std::fprintf(stderr, "Culling: %s\n", renderer.gpuCulling() ? "GPU (compute + draw indirect count)" : "CPU");
     std::fprintf(stderr, "Streaming: view radius %d chunks, %u worker threads, %s meshing\n", opt.radius,
                  pool.workerCount(), opt.greedy ? "greedy" : "binary");
 
@@ -246,7 +252,7 @@ int main(int argc, char** argv)
             const voxel::ChunkStreamer::Stats ss = streamer.stats();
             const render::MeshMemoryStats ms = renderer.meshStats();
             const std::string title = std::format(
-                "Engine2 | {:.0f} fps | render cpu {:.2f} ms (cull {:.2f}) | gpu {:.2f} ms | stream {:.2f} ms | "
+                "Engine2 | {:.0f} fps | render cpu {:.2f} ms (cpu cull {:.2f}) | gpu {:.2f} ms | stream {:.2f} ms | "
                 "{} chunks, {} draws, {:.2f}M quads | {} meshed, {} jobs, {:.1f} MB/s up, mesh mem {:.0f}/{:.0f} MiB",
                 statFrames / elapsed, cpuAccumMs / statFrames, cullAccumMs / statFrames, gpuAccumMs / statFrames,
                 streamAccumMs / statFrames, stats.drawnChunks, stats.draws, static_cast<f64>(stats.drawnQuads) / 1e6,

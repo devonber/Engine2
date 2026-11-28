@@ -6,7 +6,7 @@ target_link_libraries(engine_vk_thirdparty PUBLIC thirdparty::vulkan thirdparty:
 # ---- Shaders: GLSL -> SPIR-V, embedded as C arrays (glslc -mfmt=c) ---------------
 set(_shader_out ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${_shader_out})
-set(_shader_sources shaders/voxel.vert shaders/voxel.frag)
+set(_shader_sources shaders/voxel.vert shaders/voxel.frag shaders/cull.comp)
 set(_shader_outputs)
 foreach(src ${_shader_sources})
     get_filename_component(name ${src} NAME)

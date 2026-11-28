@@ -7,10 +7,17 @@
 //
 // Draws come from vkCmdDrawIndexedIndirect, one command per visible chunk:
 //   vertexOffset  = firstQuad * 4  -> gl_VertexIndex / 4 is the global quad index
-//   firstInstance = chunk index    -> gl_InstanceIndex selects the chunk origin
+//   firstInstance = chunk slot     -> gl_InstanceIndex selects the chunk origin
 
 layout(std430, set = 0, binding = 0) readonly buffer QuadBuffer { uvec2 quads[]; };
-layout(std430, set = 0, binding = 1) readonly buffer ChunkBuffer { ivec4 chunkOrigins[]; };
+// Per chunk slot (see GpuChunk in renderer/src/ChunkMeshStore.hpp); only the
+// origin is needed here.
+struct GpuChunk {
+    ivec4 originFirst; // xyz: world position of voxel (0,0,0)
+    uvec4 faces0;
+    uvec4 faces1;
+};
+layout(std430, set = 0, binding = 1) readonly buffer ChunkTable { GpuChunk chunks[]; };
 layout(std430, set = 0, binding = 3) readonly buffer FaceLayerBuffer { uint faceLayers[]; }; // [block * 6 + face]
 
 layout(push_constant) uniform PushConstants {
@@ -84,7 +91,7 @@ void main()
 
     // Camera-relative: the integer part is exact, so precision does not
     // depend on how far from the world origin the camera is.
-    const ivec3 voxel = chunkOrigins[gl_InstanceIndex].xyz + ivec3(local) - pc.cameraBlock.xyz;
+    const ivec3 voxel = chunks[gl_InstanceIndex].originFirst.xyz + ivec3(local) - pc.cameraBlock.xyz;
     const vec2 corner2 = vec2(float(corner & 1u), float(corner >> 1));
     const vec3 inBlock = kBase[face] + kU[face] * (corner2.x * size.x) + kV[face] * (corner2.y * size.y);
     const vec3 pos = vec3(voxel) - pc.cameraFraction.xyz + inBlock; // relative to the camera

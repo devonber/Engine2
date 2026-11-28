@@ -88,10 +88,13 @@ Vulkan 1.3, written for throughput:
   position in double precision), so precision is the same a million blocks from the origin. Each chunk's
   quads are grouped by face direction and only the directions that can face the camera are drawn (about
   27% fewer quads on terrain). The mesh buffer grows on demand. `--radius` goes up to 96.
+- **GPU-driven culling**: a compute shader tests every chunk (distance, frustum, face directions) and writes
+  the draw commands; one `vkCmdDrawIndexedIndirectCount` draws them, so the CPU never walks the chunk list.
+  Falls back to CPU culling (`--cpu-culling`) on GPUs without draw-indirect-count. Both paths produce
+  pixel-identical images.
 - **Explicit AVX2** in the hot loops (voxel bitmasks, terrain layers, face masks), with plain C++
   fallbacks, so speed does not depend on what a compiler's auto-vectoriser happens to do.
-- **One draw call for the whole world**: chunks are frustum-culled on the CPU, which writes one
-  `vkCmdDrawIndexedIndirect` command per visible chunk.
+- **One draw call for the whole world**: every visible chunk's draws are indirect commands in one buffer.
 - **Reversed-Z, infinite far plane** with a 32-bit float depth buffer: even depth precision at any distance.
 - **volk** loads Vulkan functions directly from the driver, skipping the loader's dispatch on each call.
 - **Dynamic rendering + synchronization2**: no render pass or framebuffer objects.
@@ -105,7 +108,7 @@ Sandbox controls: left-click to capture the mouse, Esc to release; WASD to move,
 up/down, Ctrl for speed. Frame rate, CPU and GPU times are shown in the title bar.
 
 Sandbox options: `--radius N` (view radius in chunks), `--vsync`, `--validation` / `--no-validation`,
-`--camera x,y,z,yawDeg,pitchDeg`, `--assets DIR`, `--mesher greedy|binary`, `--no-ao`, `--no-face-culling`, `--mesh-memory MiB`, `--threads N`,
+`--camera x,y,z,yawDeg,pitchDeg`, `--assets DIR`, `--mesher greedy|binary`, `--no-ao`, `--no-face-culling`, `--cpu-culling`, `--mesh-memory MiB`, `--threads N`,
 `--fly SPEED` (fly forward automatically, blocks/s), `--frames N` (quit N frames after the initial area
 has loaded), `--screenshot file.bmp`. The title bar shows frame, CPU, GPU and streaming times, chunks
 drawn and meshed, background jobs, upload rate and mesh memory.
