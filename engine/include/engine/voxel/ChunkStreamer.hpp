@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/core/ThreadPool.hpp"
 #include "engine/voxel/Generate.hpp"
 #include "engine/voxel/Mesher.hpp"
 
@@ -9,10 +10,6 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
-
-namespace engine {
-class ThreadPool;
-}
 
 namespace engine::voxel {
 
@@ -172,6 +169,8 @@ private:
     ChunkPool m_chunkPool;
     std::unordered_map<u64, Column> m_columns;
     std::vector<std::pair<i32, i32>> m_offsets; // (dx, dz) within viewRadius + 1, nearest first
+    usize m_scanStart = 0;                      // m_offsets[0, m_scanStart) are finished columns: skip them
+    std::vector<ThreadPool::Job> m_batch;       // jobs scheduled this update, submitted together
     ColumnCoord m_center;
     bool m_hasCenter = false;
     bool m_settled = false;

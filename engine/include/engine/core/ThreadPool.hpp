@@ -66,8 +66,22 @@ public:
     // With no workers the job runs immediately on the caller.
     void submit(Job job);
 
+    // Queue many jobs at once: one lock, and all needed workers woken
+    // together instead of one wake-up per job. Prefer this for bursts of
+    // small jobs.
+    void submit(std::vector<Job>&& jobs);
+
     // Jobs queued but not yet started.
     [[nodiscard]] u32 queuedJobs() const;
+
+    // Background-job totals since construction or the last reset, for
+    // measuring worker utilisation (busy time / (wall time * workers)).
+    struct JobStats {
+        u64 jobs = 0;
+        f64 busyMs = 0.0;
+    };
+    [[nodiscard]] JobStats jobStats() const noexcept;
+    void resetJobStats() noexcept;
 
 private:
     struct Task {
@@ -79,6 +93,9 @@ private:
 
     void run(const Task& task);
     void workerLoop();
+    // Busy-waits briefly for new work before a worker goes to sleep: waking a
+    // sleeping thread through the OS costs about as much as a small job.
+    void spinForWork(u64 seenGeneration) const noexcept;
     void process(const Task& task);
 
     std::vector<std::thread> m_threads;
@@ -94,6 +111,13 @@ private:
     std::deque<Job> m_jobs;
 
     std::atomic<u32> m_next{0}; // next index to hand out
+    // Lock-free mirrors (written under m_mutex) that spinning workers poll.
+    std::atomic<u32> m_queuedHint{0};
+    std::atomic<u64> m_generationHint{0};
+    std::atomic<bool> m_stopHint{false};
+
+    std::atomic<u64> m_jobsRun{0};
+    std::atomic<u64> m_jobBusyNs{0};
 };
 
 } // namespace engine

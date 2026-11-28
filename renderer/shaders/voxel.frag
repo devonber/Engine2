@@ -17,8 +17,19 @@ layout(location = 0) out vec4 outColor;
 
 void main()
 {
+    // inUV runs 0..width / 0..height across a greedy-merged quad: one texture
+    // tile per block. Wrap it per block ourselves and sample with CLAMP_TO_EDGE
+    // rather than relying on REPEAT: with REPEAT, filtering near a block's
+    // edge (minification, mips, anisotropy) blends in the texels from the
+    // OPPOSITE edge of the texture, e.g. a green line from the top of the
+    // grass side texture along the bottom of every grass block.
+    // Derivatives come from the unwrapped coordinates, so the jump at each
+    // block boundary does not make the GPU pick the smallest mip there.
+    const vec2 tile = fract(inUV);
+    const vec3 albedo =
+        textureGrad(blockTextures, vec3(tile, float(inLayer)), dFdx(inUV), dFdy(inUV)).rgb;
+
     // Fog hides the edge of the loaded world and matches the sky clear colour.
-    const vec3 albedo = texture(blockTextures, vec3(inUV, float(inLayer))).rgb;
     const float f = smoothstep(pc.fog.a * 0.55, pc.fog.a, inDistance);
     outColor = vec4(mix(albedo * inShade, pc.fog.rgb, f), 1.0);
 }

@@ -132,3 +132,27 @@ TEST_CASE("Mixing jobs and parallelFor under load")
     }
     REQUIRE(waitFor(jobs, 200));
 }
+
+TEST_CASE("Batch submit runs every job, in small and large batches")
+{
+    ThreadPool pool(3);
+    std::atomic<u32> done{0};
+    u32 expected = 0;
+    for (const u32 size : {1u, 2u, 3u, 50u, 1000u}) {
+        std::vector<ThreadPool::Job> batch;
+        for (u32 i = 0; i < size; ++i) {
+            batch.emplace_back([&] { done.fetch_add(1); });
+        }
+        pool.submit(std::move(batch));
+        CHECK(batch.empty());
+        expected += size;
+    }
+    REQUIRE(waitFor(done, expected));
+
+    // Sparse submits with idle gaps: workers go through spin -> sleep -> wake.
+    for (u32 i = 0; i < 20; ++i) {
+        pool.submit([&] { done.fetch_add(1); });
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    REQUIRE(waitFor(done, expected + 20));
+}

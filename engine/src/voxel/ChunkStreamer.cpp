@@ -143,6 +143,9 @@ void ChunkStreamer::update(ColumnCoord center)
     const bool moved = !m_hasCenter || center != m_center;
     m_center = center;
     m_hasCenter = true;
+    if (moved) {
+        m_scanStart = 0; // "finished" is relative to the centre
+    }
 
     const usize before = m_inFlight;
     collectCompletions();
@@ -154,6 +157,16 @@ void ChunkStreamer::update(ColumnCoord center)
     }
     if (!m_settled) {
         schedule();
+    }
+
+    // Everything scheduled above goes to the pool in one batch: one lock and
+    // one wake-up for all workers instead of one per job.
+    if (!m_batch.empty()) {
+        {
+            std::lock_guard lock(m_completionMutex);
+            m_running += static_cast<u32>(m_batch.size());
+        }
+        m_pool.submit(std::move(m_batch)); // leaves m_batch empty, keeping its capacity
     }
 }
 
@@ -260,10 +273,20 @@ void ChunkStreamer::schedule()
     ENGINE_PROFILE_FUNCTION();
     const i64 meshRadiusSq = static_cast<i64>(m_options.viewRadius) * m_options.viewRadius;
     bool workLeft = false;
+    bool prefix = true; // still in the run of finished columns at the start of the scan
 
-    for (const auto& [dx, dz] : m_offsets) {
+    for (usize i = m_scanStart; i < m_offsets.size(); ++i) {
+        const auto [dx, dz] = m_offsets[i];
         const ColumnCoord coord{m_center.x + dx, m_center.z + dz};
         Column* col = find(coord);
+        // Finished: generated, and meshed unless it is in the generate-only outer ring.
+        const bool finished = col != nullptr && col->state == State::Ready &&
+                              (col->allMeshed || static_cast<i64>(dx) * dx + static_cast<i64>(dz) * dz > meshRadiusSq);
+        if (prefix && finished) {
+            m_scanStart = i + 1;
+            continue;
+        }
+        prefix = false;
         if (col == nullptr) {
             workLeft = true;
             if (m_inFlight >= m_maxInFlight) {
@@ -299,9 +322,7 @@ void ChunkStreamer::schedule()
 
 void ChunkStreamer::trackSubmit()
 {
-    ++m_inFlight;
-    std::lock_guard lock(m_completionMutex);
-    ++m_running;
+    ++m_inFlight; // m_running is raised for the whole batch at the end of update()
 }
 
 void ChunkStreamer::finish(Completion&& completion)
@@ -325,7 +346,7 @@ void ChunkStreamer::submitGenerate(ColumnCoord coord)
     m_columns.emplace(coord.key(), col);
     trackSubmit();
 
-    m_pool.submit([this, coord, storage] {
+    m_batch.emplace_back([this, coord, storage] {
         ENGINE_PROFILE_SCOPE("generate column");
         TerrainColumn terrain;
         terrainColumn(coord.x, coord.z, terrain); // one heightmap for every layer
@@ -389,7 +410,8 @@ bool ChunkStreamer::scheduleMeshes(Column& col)
         cs.meshing = true; // keeps the column loaded while the job reads the chunk
         trackSubmit();
         const Chunk* chunk = cs.data != nullptr ? cs.data : &stoneChunk();
-        m_pool.submit([this, coord = col.coord, layer = static_cast<i32>(i), chunk, masks, greedy = m_options.greedy] {
+        m_batch.emplace_back([this, coord = col.coord, layer = static_cast<i32>(i), chunk, masks,
+                              greedy = m_options.greedy] {
             ENGINE_PROFILE_SCOPE("mesh chunk");
             // Mesh into a per-thread scratch buffer (capacity reused), then
             // copy out with one exact-size allocation.
